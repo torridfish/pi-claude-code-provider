@@ -1,0 +1,21 @@
+{
+  "name": "pi-claude-code-provider",
+  "version": "0.1.0",
+  "private": true,
+  "description": "pi provider backed by the Claude Code CLI (claude -p)",
+  "type": "module",
+  "pi": { "extensions": ["./index.ts"] },
+  "scripts": {
+    "test": "tsx --test test/*.test.ts",
+    "typecheck": "tsc --noEmit"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*",
+    "@earendil-works/pi-ai": "*"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "tsx": "^4.20.0",
+    "typescript": "^5.9.0"
+  }
+}
