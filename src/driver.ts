@@ -140,17 +140,28 @@ type DistributiveOmit<T, K extends PropertyKey> = T extends unknown ? Omit<T, K>
 
 		/** The last content block, opened on demand. Blocks grow through their
 		 *  deltas and are closed when the turn finalizes, per the protocol. */
+		let openTextIndex = -1;
+		let openThinkingIndex = -1;
 		const ensureBlock = (type: "text" | "thinking"): number => {
 			begin();
-			const last = message.content.at(-1);
-			if (last && last.type === type) return message.content.length - 1;
+			const open = type === "text" ? openTextIndex : openThinkingIndex;
+			if (open !== -1) return open;
 			message.content.push(type === "text" ? { type: "text", text: "" } : { type: "thinking", thinking: "" });
 			const index = message.content.length - 1;
+			if (type === "text") openTextIndex = index; else openThinkingIndex = index;
 			push(type === "text" ? { type: "text_start", contentIndex: index } : { type: "thinking_start", contentIndex: index });
 			return index;
 		};
+		/** Close an open block: the protocol's authoritative end, carrying the
+		 *  accumulated content. Activities close eagerly — each is a complete
+		 *  unit, and the answer must not stick to the back of one. */
+		const closeBlock = (type: "text" | "thinking") => {
+			const index = type === "text" ? openTextIndex : openThinkingIndex;
+			if (index === -1) return;
+			if (type === "text") { openTextIndex = -1; push({ type: "text_end", contentIndex: index, content: (message.content[index] as { text: string }).text }); }
+			else { openThinkingIndex = -1; push({ type: "thinking_end", contentIndex: index, content: (message.content[index] as { thinking: string }).thinking }); }
+		};
 
-		// An activity line lands in the text block, visually separated.
 		const addText = (delta: string) => {
 			const index = ensureBlock("text");
 			(message.content[index] as { text: string }).text += delta;
@@ -161,7 +172,12 @@ type DistributiveOmit<T, K extends PropertyKey> = T extends unknown ? Omit<T, K>
 			(message.content[index] as { thinking: string }).thinking += delta;
 			push({ type: "thinking_delta", contentIndex: index, delta });
 		};
-		const addActivity = (line: string) => addText(`\n▸ ${line}`);
+		/** One activity line, its own block, closed immediately. */
+		const addActivity = (line: string) => {
+			closeBlock("text");
+			addText(`▸ ${line}\n`);
+			closeBlock("text");
+		};
 
 		let stderrTail = "";
 		let exited = false;
@@ -226,6 +242,8 @@ type DistributiveOmit<T, K extends PropertyKey> = T extends unknown ? Omit<T, K>
 			message.stopReason = reason;
 			options?.signal?.removeEventListener("abort", onAbort);
 			try { proc.stdin?.end(); } catch { /* already gone */ }
+			closeBlock("text");
+			closeBlock("thinking");
 			push({ type: "done", reason, message });
 		};
 
@@ -274,12 +292,18 @@ type DistributiveOmit<T, K extends PropertyKey> = T extends unknown ? Omit<T, K>
 				if (evt.type === "user" && evt.message) {
 					for (const block of evt.message.content ?? []) {
 						if (block.type === "tool_result") {
-							const content = Array.isArray(block.content)
-								? block.content.filter((c: any) => c.type === "text").map((c: any) => c.text).join(" ")
-								: "";
-							const status = block.is_error ? "error" : "done";
+							// Claude Code's tool_result content is a string or a
+							// block array, depending on the tool.
+							const raw = block.content;
+							const content = typeof raw === "string"
+								? raw
+								: Array.isArray(raw)
+									? raw.filter((c: any) => c.type === "text").map((c: any) => c.text).join(" ")
+									: "";
 							const head = String(content).slice(0, 80).replace(/\n/g, " ");
-							addActivity(status === "error" ? `✗ ${head || "tool error"}` : head);
+							// An empty result says nothing; a bare activity line for it
+							// would only masquerade as the answer that follows.
+							if (head.trim() || block.is_error) addActivity(block.is_error ? `✗ ${head || "tool error"}` : head);
 						}
 					}
 					continue;
