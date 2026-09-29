@@ -23,7 +23,8 @@
  *    carries text only here.
  */
 import type { ExtensionAPI, ProviderModelConfig } from "@earendil-works/pi-coding-agent";
-import { getCurrentSystemPrompt, type Api, type Model, type SimpleStreamOptions, type TranscriptContext } from "@earendil-works/pi-ai/compat";
+import type { Api, Model, SimpleStreamOptions, TranscriptContext } from "@earendil-works/pi-ai/compat";
+import { getCurrentSystemPrompt } from "@earendil-works/pi-ai/utils/transcript";
 import { buildCatalog, resolveClaudeBinary } from "./src/catalog.ts";
 import { DEFAULT_TOOLS, streamClaudeTurn, type ClaudeDriverConfig } from "./src/driver.ts";
 import { serializeTranscript } from "./src/serialize.ts";

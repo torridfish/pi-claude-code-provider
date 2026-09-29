@@ -18,16 +18,20 @@
  * `-p` with stream-json is Claude Code's documented headless interface.
  */
 import { spawn } from "node:child_process";
-import {
-	createAssistantMessageEventStream,
-	getCurrentSystemPrompt,
-	type Api,
-	type AssistantMessage,
-	type AssistantMessageEvent,
-	type Model,
-	type SimpleStreamOptions,
-	type TranscriptContext,
+import type {
+	Api,
+	AssistantMessage,
+	AssistantMessageEvent,
+	Model,
+	SimpleStreamOptions,
+	TranscriptContext,
 } from "@earendil-works/pi-ai/compat";
+import { createAssistantMessageEventStream } from "@earendil-works/pi-ai/utils/event-stream";
+// From the util subpaths rather than the compat barrel: an extension loaded by
+// the host's module loader can have the barrel's circular internals snapshotted
+// mid-evaluation, dropping re-exported names (observed: getCurrentSystemPrompt
+// undefined in a child process). The leaf subpaths have no cycle to fall into.
+import { getCurrentSystemPrompt } from "@earendil-works/pi-ai/utils/transcript";
 import { serializeTranscript } from "./serialize.ts";
 
 /** The standard built-in set a headless child is pre-approved to use. Read
