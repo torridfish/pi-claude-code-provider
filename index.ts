@@ -12,10 +12,15 @@
  *
  * Stage one of the idea that claude code is a provider, not a runner. Known
  * edges, all deliberate:
- *  - Claude's tool calls travel as activity lines in the streamed text, not
- *    as pi tool calls — emitting those would make pi execute tools that
- *    belong to the claude harness. A later stage can relay them back through
- *    an MCP bridge if pi is to own tool execution.
+ *  - Claude's own tool calls travel as activity lines in the streamed text,
+ *    not as pi tool calls — emitting those would make pi execute tools that
+ *    belong to the claude harness.
+ *  - Inside a pi-subagents child, the tools that ARE pi's travel the other
+ *    way: the ask bridge surfaces caller_ping, and the tool relay surfaces
+ *    every other active tool of the child pi as a real pi tool call, so the
+ *    agent's declared tool list is what claude actually gets — executed by
+ *    pi, auto-approved in the headless child, rendered like any other tool
+ *    row. Claude keeps its own harness tools alongside the relayed ones.
  *  - The child is spawned fresh per request outside a subagent run — pi can
  *    rewrite its transcript between requests (compaction, branch, undo), and
  *    a child that re-reads the transcript each turn is always where the
@@ -33,11 +38,14 @@
  *    asking claude process parked until the parent's answer arrives — the
  *    ask flows to the parent through the child pi's own channel.
  */
+import * as fs from "node:fs";
+import { fileURLToPath } from "node:url";
 import type { ExtensionAPI, ProviderModelConfig } from "@earendil-works/pi-coding-agent";
 import type { Api, Model, SimpleStreamOptions, TranscriptContext } from "@earendil-works/pi-ai/compat";
 import { getCurrentSystemPrompt } from "@earendil-works/pi-ai/utils/transcript";
 import { buildCatalog, resolveClaudeBinary } from "./src/catalog.ts";
-import { resolveAskServerPath } from "./src/ask.ts";
+import { ASK_PI_TOOL, resolveAskServerPath } from "./src/ask.ts";
+import type { RelayToolSpec } from "./src/relay.ts";
 import { DEFAULT_TOOLS, streamClaudeTurn, type ClaudeDriverConfig } from "./src/driver.ts";
 import { serializeTranscript } from "./src/serialize.ts";
 
@@ -75,6 +83,35 @@ const SUBAGENT_RUN_DIR = process.env.PI_SUBAGENT_RUN_DIR;
  *  the ask server cannot be located — the bridge is off in either case. */
 const ASK_SERVER_PATH = SUBAGENT_RUN_DIR ? resolveAskServerPath() : undefined;
 
+/** The relay server is this package's own, so its path needs no resolution. */
+const RELAY_SERVER_PATH = fileURLToPath(new URL("./src/relay-server.mjs", import.meta.url));
+
+/** The extension API handle, captured at registration. The relay reads the
+ *  child's active tools through it, live per spawn — other extensions
+ *  register their tools after this one loads, so a snapshot taken here would
+ *  miss them. */
+let piHandle: ExtensionAPI | undefined;
+
+/** The child pi's active tools, minus the ask tool — claude reaches
+ *  caller_ping through the ask bridge, which is not the relay's business.
+ *  Prompt guidelines fold into the description: MCP has no equivalent field,
+ *  and a tool introduced without its usage advice is a tool misused. */
+function relayToolCatalog(): RelayToolSpec[] {
+	if (!piHandle) return [];
+	const active = new Set(piHandle.getActiveTools());
+	const specs: RelayToolSpec[] = [];
+	for (const tool of piHandle.getAllTools()) {
+		if (!active.has(tool.name) || tool.name === ASK_PI_TOOL) continue;
+		const guidelines = Array.isArray(tool.promptGuidelines) ? tool.promptGuidelines.join("\n\n") : tool.promptGuidelines;
+		specs.push({
+			name: tool.name,
+			description: [tool.description, guidelines].filter((s): s is string => !!s && s.trim().length > 0).join("\n\n"),
+			inputSchema: (tool.parameters as Record<string, unknown>) ?? { type: "object", properties: {} },
+		});
+	}
+	return specs;
+}
+
 export function resolveConfig(): ClaudeDriverConfig {
 	const command = process.env.CLAUDE_CODE_PROVIDER_COMMAND || "claude";
 	const tools = (process.env.CLAUDE_CODE_PROVIDER_TOOLS || DEFAULT_TOOLS.join(","))
@@ -87,6 +124,8 @@ export function resolveConfig(): ClaudeDriverConfig {
 		maxBudgetUsd: Number.isFinite(budget) && budget > 0 ? budget : undefined,
 		subagentRunDir: SUBAGENT_RUN_DIR,
 		askServerPath: ASK_SERVER_PATH,
+		relayServerPath: fs.existsSync(RELAY_SERVER_PATH) ? RELAY_SERVER_PATH : undefined,
+		getRelayTools: piHandle ? relayToolCatalog : undefined,
 	};
 }
 
@@ -126,6 +165,7 @@ export async function refreshModels(): Promise<ProviderModelConfig[]> {
 }
 
 export default function (pi: ExtensionAPI) {
+	piHandle = pi;
 	pi.registerProvider("claude-code", {
 		name: "Claude Code",
 		// No endpoint and no key of ours: the claude binary owns its own auth

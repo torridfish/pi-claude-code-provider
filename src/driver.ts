@@ -16,19 +16,30 @@
  * which pi cannot rewind. A subagent run is append-only in practice, which is
  * what makes residency safe there.
  *
- * What is deliberately NOT mapped onto pi: tool calls. Emitting a toolCall
- * block would make pi execute it, and the tool it names belongs to Claude
- * Code, not to pi. Claude's tool activity travels as activity lines inside
- * the streamed text instead, so the pi TUI shows what the child is doing
- * without ever running a second copy of it.
+ * What is deliberately NOT mapped onto pi: claude's OWN tool calls. Emitting
+ * a toolCall block would make pi execute it, and the tool it names belongs to
+ * Claude Code, not to pi. Claude's own tool activity travels as activity
+ * lines inside the streamed text instead, so the pi TUI shows what the child
+ * is doing without ever running a second copy of it.
  *
- * The one exception is the ask bridge: inside a pi-subagents run dir, claude's
- * `caller_ping` call is surfaced as a REAL pi tool call, because that tool is
- * the child pi's own (registered by herdr/child.ts, not part of claude's
- * harness) — pi executing it is how the question reaches the parent. The
- * claude process that asked is then parked, not killed: its stdin stays open
- * so its in-process context survives, and the request that carries the
- * parent's answer adopts it and feeds the answer in. See `Session`.
+ * The exceptions are the tools that are pi's own, surfaced as REAL tool calls
+ * inside a pi-subagents run dir, where pi's loop executes them:
+ *
+ *  - caller_ping, through the ask bridge: the tool is the child pi's own
+ *    (registered by herdr/child.ts), and pi executing it is how the question
+ *    reaches the parent. The claude process that asked is then parked, not
+ *    killed: its stdin stays open so its in-process context survives, and
+ *    the request that carries the parent's answer adopts it and feeds the
+ *    answer in. See `Session`.
+ *
+ *  - everything else the child pi has active, through the tool relay: the
+ *    driver spawns a second MCP sidecar (`pi_relay`) that serves the child
+ *    pi's active tools, surfaces claude's calls as real pi tool calls, and
+ *    feeds each executed result back to the waiting server. pi's renderer
+ *    shows the calls as ordinary tool rows; the transcripts keeps them; and
+ *    an agent's declared tool list becomes authoritative instead of claude's
+ *    built-ins deciding. See `relay.ts`. The relay is additive — claude
+ *    keeps its own harness tools alongside, and reaches for whichever fits.
  *
  * The park is the general rule, not the ask's special case: inside a run dir
  * every spawned child stays resident after its request settles, and every
@@ -66,6 +77,7 @@ import { createAssistantMessageEventStream } from "@earendil-works/pi-ai/utils/e
 // undefined in a child process). The leaf subpaths have no cycle to fall into.
 import { getCurrentSystemPrompt } from "@earendil-works/pi-ai/utils/transcript";
 import { ASK_PI_TOOL, ASK_SERVER, ASK_TOOL } from "./ask.ts";
+import { RELAY_PREFIX, RELAY_SERVER, deliverRelayResult, relayToolMcpName, writeRelayCatalog, type RelayToolSpec } from "./relay.ts";
 import { flattenText, serializeTranscript } from "./serialize.ts";
 
 /** The standard built-in set a headless child is pre-approved to use. Read
@@ -98,6 +110,13 @@ export interface ClaudeDriverConfig {
 	 *  meaningful together with `subagentRunDir`; the bridge is off when
 	 *  either half is missing. */
 	askServerPath?: string;
+	/** The pi tool relay: the MCP server script that serves the child pi's own
+	 *  tools to claude. Meaningful together with `getRelayTools`; the relay is
+	 *  off when either half is missing. */
+	relayServerPath?: string;
+	/** The child pi's active tools, as the relay serves them. Read live per
+	 *  spawn — other extensions register after this one loads. */
+	getRelayTools?: () => RelayToolSpec[];
 }
 
 /** pi's thinking levels are broader than Claude Code's `--effort`; "off" and
@@ -119,12 +138,16 @@ export function resolveEffort(reasoning: string | undefined): string | undefined
 }
 
 /** The child's argv, exported for tests: this is the contract with the CLI. */
-export function buildClaudeCodeArgs(model: string, effort: string | undefined, systemPrompt: string, config: ClaudeDriverConfig, sessionId?: string, resume = false): string[] {
+export function buildClaudeCodeArgs(model: string, effort: string | undefined, systemPrompt: string, config: ClaudeDriverConfig, opts: { sessionId?: string; resume?: boolean; relayTools?: RelayToolSpec[] } = {}): string[] {
 	// The ask bridge exists only when both halves are configured; either alone
 	// would name a tool no server answers.
 	const askBridge = !!(config.subagentRunDir && config.askServerPath);
+	// The relay likewise, and only inside a run dir — its tool calls travel
+	// through pi's own loop, which only a subagent child has.
+	const relayTools = config.subagentRunDir && config.relayServerPath ? opts.relayTools ?? [] : [];
 	const allowed = [...config.allowedTools];
 	if (askBridge) allowed.push(ASK_TOOL);
+	for (const tool of relayTools) allowed.push(relayToolMcpName(tool.name));
 	const args = [
 		"-p",
 		"--input-format", "stream-json",
@@ -140,20 +163,28 @@ export function buildClaudeCodeArgs(model: string, effort: string | undefined, s
 	// The id-spelling the dedicated claude runner also uses: a run names its
 	// conversation at first spawn and joins it by id when picked back up. Left
 	// off outside a run dir, where the child is fresh per request by design.
-	if (sessionId) args.push(resume ? "--resume" : "--session-id", sessionId);
+	if (opts.sessionId) args.push(opts.resume ? "--resume" : "--session-id", opts.sessionId);
+	// One --mcp-config for both sidecars: the ask server, when the bridge is
+	// on, and the relay, when it is. Each definition spells out the run dir
+	// because the claude child's own env is scrubbed of PI_SUBAGENT_* when it
+	// is spawned.
+	const servers: Record<string, unknown> = {};
 	if (askBridge) {
-		// The same shape runners/claude.ts passes: one inline server definition,
-		// with the run directory spelled out because the claude child's own env
-		// is scrubbed of PI_SUBAGENT_* when it is spawned below.
-		args.push("--mcp-config", JSON.stringify({
-			mcpServers: {
-				[ASK_SERVER]: {
-					command: process.execPath,
-					args: [config.askServerPath],
-					env: { PI_SUBAGENT_RUN_DIR: config.subagentRunDir },
-				},
-			},
-		}));
+		servers[ASK_SERVER] = {
+			command: process.execPath,
+			args: [config.askServerPath],
+			env: { PI_SUBAGENT_RUN_DIR: config.subagentRunDir },
+		};
+	}
+	if (relayTools.length > 0) {
+		servers[RELAY_SERVER] = {
+			command: process.execPath,
+			args: [config.relayServerPath],
+			env: { PI_SUBAGENT_RUN_DIR: config.subagentRunDir },
+		};
+	}
+	if (Object.keys(servers).length > 0) {
+		args.push("--mcp-config", JSON.stringify({ mcpServers: servers }));
 	}
 	if (effort) args.push("--effort", effort);
 	if (systemPrompt.trim()) args.push("--append-system-prompt", systemPrompt);
@@ -194,6 +225,10 @@ class Session {
 	/** The tool_use id of the ask this session surfaced to pi; the request that
 	 *  continues past pi's own caller_ping result references it. */
 	askToolCallId: string | undefined;
+	/** Relay calls surfaced to pi and not yet answered. Keyed by the pi
+	 *  toolCall id (claude's tool_use id); the continuation request's
+	 *  toolResults are matched against this to feed the waiting relay server. */
+	relayed = new Map<string, { tool: string; args: unknown; delivered: boolean }>();
 	/** Stream events that arrived with no request attached to consume them. */
 	buffer: any[] = [];
 	/** The request currently consuming this child's stream, if any. */
@@ -427,7 +462,7 @@ function createTurn(
 	};
 }
 
-/** Surface a `caller_ping` call as a real pi tool call: the one toolUse this
+/** Surface a caller_ping call as a real pi tool call: the one toolUse this
  *  provider lets pi execute, because the tool is the child pi's own. */
 function surfaceAsk(turn: Turn, session: Session, block: any): void {
 	turn.closeBlock("text");
@@ -450,6 +485,56 @@ function surfaceAsk(turn: Turn, session: Session, block: any): void {
 	turn.message.usage = zeroUsage();
 	turn.finish("toolUse");
 	if (session.sink === turn) session.sink = null;
+}
+
+/** Surface relayed tool calls as real pi tool calls: pi executes what claude
+ *  asked for, and the results come back in the next request's transcript to
+ *  be fed to the waiting relay server. The turn ends the same way an ask
+ *  does — pi's loop only continues past a toolCall in a NEW request. */
+function surfaceRelayCalls(turn: Turn, session: Session, blocks: any[]): void {
+	if (turn.isFinished()) return;
+	turn.closeBlock("text");
+	turn.closeBlock("thinking");
+	let surfaced = 0;
+	for (const block of blocks) {
+		const tool = typeof block.name === "string" && block.name.length > RELAY_PREFIX.length
+			? block.name.slice(RELAY_PREFIX.length)
+			: "";
+		if (!tool) continue;
+		const toolCall: ToolCall = {
+			type: "toolCall",
+			id: typeof block.id === "string" && block.id ? block.id : `relay_${Date.now()}_${surfaced}`,
+			name: tool,
+			arguments: (block.input ?? {}) as ToolCall["arguments"],
+		};
+		turn.message.content.push(toolCall);
+		const contentIndex = turn.message.content.length - 1;
+		turn.push({ type: "toolcall_start", contentIndex });
+		turn.push({ type: "toolcall_end", contentIndex, toolCall });
+		session.relayed.set(toolCall.id, { tool, args: block.input ?? {}, delivered: false });
+		surfaced++;
+	}
+	if (surfaced === 0) return;
+	session.idle = false;
+	// Same accounting as the ask: the turn's authoritative result replays into
+	// the continuation request, and these tokens would be counted twice.
+	turn.message.usage = zeroUsage();
+	turn.finish("toolUse");
+	if (session.sink === turn) session.sink = null;
+}
+
+/** Feed executed results to the relay server. Scans the transcript for tool
+ *  results of calls this session surfaced and not yet delivered; each becomes
+ *  a file the blocked tools/call picks up by its (tool, arguments) key. */
+function deliverRelayResults(session: Session, context: TranscriptContext): void {
+	if (session.relayed.size === 0) return;
+	for (const message of context.messages) {
+		if (message.role !== "toolResult") continue;
+		const entry = session.relayed.get(message.toolCallId);
+		if (!entry || entry.delivered) continue;
+		entry.delivered = true;
+		deliverRelayResult(session.runDir, message.toolCallId, entry.tool, entry.args, flattenText(message.content), message.isError);
+	}
 }
 
 /**
@@ -479,10 +564,15 @@ function applyEvent(evt: any, turn: Turn, session: Session | null, config: Claud
 			turn.message.usage.cacheWrite += u.cache_creation_input_tokens || 0;
 			turn.message.usage.totalTokens = turn.message.usage.input + turn.message.usage.output + turn.message.usage.cacheRead + turn.message.usage.cacheWrite;
 		}
+		const pendingRelay: any[] = [];
 		for (const block of evt.message.content ?? []) {
 			if (block.type === "tool_use") {
 				if (session && block.name === ASK_TOOL) {
 					surfaceAsk(turn, session, block);
+					continue;
+				}
+				if (session && typeof block.name === "string" && block.name.startsWith(RELAY_PREFIX)) {
+					pendingRelay.push(block);
 					continue;
 				}
 				const input = block.input ?? {};
@@ -494,15 +584,17 @@ function applyEvent(evt: any, turn: Turn, session: Session | null, config: Claud
 				turn.addThinking(block.thinking);
 			}
 		}
+		if (pendingRelay.length > 0 && session) surfaceRelayCalls(turn, session, pendingRelay);
 		return;
 	}
 
 	if (evt.type === "user" && evt.message) {
 		for (const block of evt.message.content ?? []) {
 			if (block.type === "tool_result") {
-				// The ask's own tool result needs no activity line: pi already
-				// holds its own record of the call it executed.
-				if (session && block.tool_use_id && block.tool_use_id === session.askToolCallId) continue;
+				// Results of calls pi executed itself — the ask, and relayed tools —
+				// need no activity line: pi already holds its own record of them.
+				if (session && block.tool_use_id
+					&& (block.tool_use_id === session.askToolCallId || session.relayed.has(block.tool_use_id))) continue;
 				// Claude Code's tool_result content is a string or a block array,
 				// depending on the tool.
 				const raw = block.content;
@@ -578,6 +670,10 @@ function attachSession(
 		const text = flattenText(last.content);
 		if (text.trim()) deliver = text;
 	}
+	// Results of relayed calls pi just executed travel to the waiting relay
+	// server here; claude is blocked inside those tools/call and resumes the
+	// moment the files land.
+	deliverRelayResults(session, context);
 	if (!deliver && session.idle && session.buffer.length === 0) {
 		// An idle child streams nothing until its stdin gets a message; without
 		// one this request could only hang.
@@ -637,6 +733,10 @@ export function streamClaudeTurn(
 			const systemPrompt = getCurrentSystemPrompt(context.messages);
 			const effort = resolveEffort(options?.reasoning);
 			const fullPayload = serializeTranscript(context.messages);
+			// The relay's catalog is published before every spawn: cheap, and it
+			// keeps the file honest if the child's active tools changed under us.
+			const relayTools = inRun && config.relayServerPath && config.getRelayTools ? config.getRelayTools() : [];
+			if (relayTools.length > 0) writeRelayCatalog(config.subagentRunDir!, relayTools);
 			// Inside a run dir the child persists its conversation under a stable
 			// id, recorded in the run dir: the first spawn names it, and a run
 			// picked back up after a restart joins it instead of starting over.
@@ -663,6 +763,10 @@ export function streamClaudeTurn(
 				for (const key of Object.keys(env)) {
 					if (key.startsWith("PI_SUBAGENT_")) delete env[key];
 				}
+				// A relayed tool may legitimately run for minutes — a nested
+				// subagent does. The default MCP tool timeout would kill the
+				// waiting tools/call long before pi reports back.
+				if (relayTools.length > 0 && !env.MCP_TOOL_TIMEOUT) env.MCP_TOOL_TIMEOUT = "1800000";
 				spawnOptions = { ...spawnOptions, env };
 			}
 
@@ -677,7 +781,7 @@ export function streamClaudeTurn(
 				const sessionIdNow = attempt === 1 ? sessionId! : crypto.randomUUID();
 				if (attempt > 1 && resume) writeSessionId(config.subagentRunDir!, sessionIdNow);
 				const attemptPayload = attempt === 1 ? payload : fullPayload;
-				const argv = buildClaudeCodeArgs(model.id, effort, systemPrompt, config, sessionIdNow, useResume);
+				const argv = buildClaudeCodeArgs(model.id, effort, systemPrompt, config, { sessionId: sessionIdNow, resume: useResume, relayTools });
 				// Request inspection, honored the way a custom stream must: the hook
 				// sees what would be sent, and a replacement payload becomes the
 				// message that actually travels.
