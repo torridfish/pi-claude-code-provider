@@ -3,9 +3,11 @@ import assert from "node:assert/strict";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
+import { fileURLToPath } from "node:url";
 import { normalizeContext, type Message, type TranscriptContext } from "@earendil-works/pi-ai/compat";
 import { serializeTranscript, TRANSCRIPT_HEADER } from "../src/serialize.ts";
-import { buildClaudeCodeArgs, DEFAULT_TOOLS, resolveEffort, streamClaudeTurn, type ClaudeDriverConfig } from "../src/driver.ts";
+import { ASK_PI_TOOL, ASK_TOOL } from "../src/ask.ts";
+import { buildClaudeCodeArgs, DEFAULT_TOOLS, parkedAsks, resolveEffort, streamClaudeTurn, type ClaudeDriverConfig } from "../src/driver.ts";
 
 function zeroUsage() {
 	return { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } };
@@ -88,6 +90,31 @@ test("optional pieces are omitted, and an empty tool table is spelled explicitly
 	assert.equal(resolveEffort("minimal"), "low");
 	assert.equal(resolveEffort(undefined), undefined);
 });
+
+// ── The ask bridge's argv ───────────────────────────────────────────
+
+const BRIDGE_CONFIG: ClaudeDriverConfig = { ...CONFIG, subagentRunDir: "/run/dir", askServerPath: "/srv/ask.mjs" };
+
+test("the ask bridge travels in argv only when run dir and server are both configured", () => {
+	const args = buildClaudeCodeArgs("claude-sonnet-5", undefined, "", BRIDGE_CONFIG);
+	const mcpIdx = args.indexOf("--mcp-config");
+	assert.ok(mcpIdx !== -1, "the ask server is handed over via --mcp-config");
+	const server = JSON.parse(args[mcpIdx + 1]).mcpServers.pi_subagents;
+	assert.equal(server.command, process.execPath);
+	assert.deepEqual(server.args, ["/srv/ask.mjs"]);
+	assert.deepEqual(server.env, { PI_SUBAGENT_RUN_DIR: "/run/dir" });
+	// The mangled MCP name is what claude pre-approves; it rides the same
+	// variadic list as the built-ins.
+	assert.equal(args[args.indexOf("--allowedTools") + 1 + DEFAULT_TOOLS.length], ASK_TOOL);
+
+	// A run dir without a server is a bridge that is off, not a broken child.
+	const degraded = buildClaudeCodeArgs("claude-sonnet-5", undefined, "", { ...CONFIG, subagentRunDir: "/run/dir" });
+	assert.ok(!degraded.includes("--mcp-config"));
+	assert.ok(!degraded.includes(ASK_TOOL));
+	// And none of this appears outside a run dir.
+	assert.ok(!CONFIG_ARGS.includes("--mcp-config"));
+});
+const CONFIG_ARGS = buildClaudeCodeArgs("claude-sonnet-5", "high", "be brief", CONFIG);
 
 // ── The whole stream, against a stand-in ──────────────────────────────
 //
@@ -266,4 +293,292 @@ test("a claude that cannot start is an error, not a hang", async () => {
 	const error = events.at(-1);
 	assert.equal(error.type, "error");
 	assert.match(error.error.errorMessage, /nonexistent|ENOENT/);
+});
+
+// ── The ask bridge, end to end ────────────────────────────────────────
+//
+// A stand-in for Claude Code that also fakes its half of the ask MCP
+// handshake: it parses `--mcp-config`, spawns the REAL sibling ask server, and
+// speaks JSON-RPC to it exactly as claude would — initialize, tools/list,
+// tools/call. Its first turn asks one question; every later stdin message is
+// the caller speaking, echoed back as a new turn. It logs its boot (once per
+// process) and every stdin line, which is how the tests tell "the answer
+// reached the parked child" from "a second child was spawned".
+
+const FAKE_CLAUDE_ASK = `
+import fs from "node:fs";
+import { spawn } from "node:child_process";
+const argv = process.argv.slice(2);
+const emit = (o) => process.stdout.write(JSON.stringify(o) + "\\n");
+const appendLog = (o) => { if (process.env.FAKE_CLAUDE_LOG) fs.appendFileSync(process.env.FAKE_CLAUDE_LOG, JSON.stringify(o) + "\\n"); };
+const slow = process.env.FAKE_CLAUDE_SLOW === "1";
+appendLog({ boot: true, argv, subagentEnv: process.env.PI_SUBAGENT_RUN_DIR ?? null });
+
+const mcpIdx = argv.indexOf("--mcp-config");
+if (mcpIdx === -1) {
+  emit({ type: "result", subtype: "error_during_execution", is_error: true, result: "ask fake spawned without --mcp-config" });
+  process.exit(1);
+}
+const server = JSON.parse(argv[mcpIdx + 1]).mcpServers.pi_subagents;
+const child = spawn(server.command, server.args, { env: Object.assign({}, process.env, server.env), stdio: ["pipe", "pipe", "pipe"] });
+let mcpBuf = "";
+const pending = new Map();
+child.stdout.on("data", (d) => {
+  mcpBuf += d;
+  let i;
+  while ((i = mcpBuf.indexOf("\\n")) !== -1) {
+    const line = mcpBuf.slice(0, i);
+    mcpBuf = mcpBuf.slice(i + 1);
+    if (!line.trim()) continue;
+    let msg;
+    try { msg = JSON.parse(line); } catch { continue; }
+    const waiter = pending.get(msg.id);
+    if (waiter) { pending.delete(msg.id); waiter(msg); }
+  }
+});
+let rpcId = 0;
+const rpc = (method, params) => new Promise((resolve) => {
+  const id = String(++rpcId);
+  pending.set(id, resolve);
+  child.stdin.write(JSON.stringify({ jsonrpc: "2.0", id, method, params }) + "\\n");
+});
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+// The handshake as Claude Code does it: initialize, initialized, tools/list.
+await rpc("initialize", { protocolVersion: "2025-06-18", capabilities: {}, clientInfo: { name: "fake-claude", version: "1" } });
+child.stdin.write(JSON.stringify({ jsonrpc: "2.0", method: "notifications/initialized" }) + "\\n");
+const listed = await rpc("tools/list", {});
+const toolName = listed.result.tools[0].name;
+appendLog({ mcp: { tools: listed.result.tools.map((t) => t.name) } });
+
+emit({ type: "system", subtype: "init", model: "claude-sonnet-5" });
+
+let buf = "";
+const queue = [];
+let waiter;
+process.stdin.on("data", (c) => {
+  buf += c;
+  let i;
+  while ((i = buf.indexOf("\\n")) !== -1) {
+    const line = buf.slice(0, i);
+    buf = buf.slice(i + 1);
+    if (!line.trim()) continue;
+    let msg;
+    try { msg = JSON.parse(line); } catch { continue; }
+    const text = msg.message && msg.message.content && msg.message.content[0] ? msg.message.content[0].text : "";
+    appendLog({ stdin: text });
+    if (waiter) { const w = waiter; waiter = undefined; w(text); } else queue.push(text);
+  }
+});
+process.stdin.on("end", () => process.exit(0));
+const nextMessage = () => new Promise((r) => { if (queue.length) r(queue.shift()); else waiter = r; });
+const QUESTION = "Which auth module should I map first?";
+
+// Turn one: preamble, the ask, the MCP round trip, then the closing turn.
+await nextMessage();
+emit({ type: "stream_event", event: { type: "content_block_delta", delta: { type: "text_delta", text: "Checking with my caller. " } } });
+emit({ type: "assistant", message: { role: "assistant", content: [
+  { type: "tool_use", id: "ask1", name: "mcp__pi_subagents__" + toolName, input: { question: QUESTION } },
+] } });
+const call = await rpc("tools/call", { name: toolName, arguments: { question: QUESTION } });
+const resultText = call.result.content.map((c) => c.text).join(" ");
+emit({ type: "user", message: { role: "user", content: [
+  { type: "tool_result", tool_use_id: "ask1", content: [{ type: "text", text: resultText }], is_error: !!call.result.isError },
+] } });
+const closing = "Asked my caller and will wait for the answer.";
+if (slow) {
+  await sleep(150);
+  emit({ type: "stream_event", event: { type: "content_block_delta", delta: { type: "text_delta", text: closing } } });
+  await sleep(150);
+} else {
+  emit({ type: "stream_event", event: { type: "content_block_delta", delta: { type: "text_delta", text: closing } } });
+}
+emit({ type: "assistant", message: { role: "assistant", content: [{ type: "text", text: closing }] } });
+emit({ type: "result", subtype: "success", is_error: false, result: closing,
+  usage: { input_tokens: 150, output_tokens: 25, cache_read_input_tokens: 5, cache_creation_input_tokens: 0 },
+  total_cost_usd: 0.02, num_turns: 2 });
+
+// Every later stdin message is the caller speaking; echo it and keep the
+// floor — the parked child never exits until its stdin closes.
+for (;;) {
+  const message = await nextMessage();
+  const reply = "Answered: " + message;
+  emit({ type: "stream_event", event: { type: "content_block_delta", delta: { type: "text_delta", text: reply } } });
+  emit({ type: "assistant", message: { role: "assistant", content: [{ type: "text", text: reply }] } });
+  emit({ type: "result", subtype: "success", is_error: false, result: reply,
+    usage: { input_tokens: 300, output_tokens: 40, cache_read_input_tokens: 10, cache_creation_input_tokens: 0 },
+    total_cost_usd: 0.03, num_turns: 3 });
+}
+`;
+
+const ASK_SERVER_PATH = fileURLToPath(new URL("../../pi-subagents-herdr/runners/claude-ask.mjs", import.meta.url));
+const askBridgeTest = fs.existsSync(ASK_SERVER_PATH) ? test : test.skip;
+
+function contextWith(messages: Message[]): TranscriptContext {
+	return normalizeContext({ systemPrompt: "be brief", tools: [], messages });
+}
+
+const ASK_TURN: Message[] = [
+	{ role: "user", content: "map auth", timestamp: 1 } as Message,
+	{ role: "assistant", api: "test", provider: "test", model: "m", usage: zeroUsage(), stopReason: "toolUse", timestamp: 2,
+		content: [{ type: "toolCall", id: "ask1", name: ASK_PI_TOOL, arguments: { question: "Which auth module should I map first?" } }] },
+	{ role: "toolResult", toolCallId: "ask1", toolName: ASK_PI_TOOL, isError: false,
+		content: [{ type: "text", text: "Question sent to your caller. Stop now: end your turn without calling another tool and without assuming an answer." }], timestamp: 3 },
+];
+
+const ANSWER = "Your caller answered: map src/auth.ts first.\n\nCarry on from where you stopped.";
+
+const textOf = (message: any) => message.content.filter((c: any) => c.type === "text").map((c: any) => c.text).join("");
+
+async function waitUntil(check: () => boolean, timeoutMs = 2000): Promise<void> {
+	const start = Date.now();
+	while (!check()) {
+		if (Date.now() - start > timeoutMs) throw new Error("timed out waiting for a condition");
+		await new Promise((r) => setTimeout(r, 25));
+	}
+}
+
+test("outside a run dir a caller_ping call is an activity line like any other claude tool", async () => {
+	const directory = fs.mkdtempSync(path.join(os.tmpdir(), "provider-noask-test-"));
+	const claude = stubClaude(directory, `
+import fs from "node:fs";
+const emit = (o) => process.stdout.write(JSON.stringify(o) + "\\n");
+let buf = "";
+process.stdin.on("end", () => process.exit(0));
+process.stdin.on("data", (c) => {
+  buf += c;
+  if (!buf.includes("\\n")) return;
+  if (process.env.FAKE_CLAUDE_LOG) fs.appendFileSync(process.env.FAKE_CLAUDE_LOG, JSON.stringify({ argv: process.argv.slice(2) }) + "\\n");
+  emit({ type: "system", subtype: "init", model: "claude-sonnet-5" });
+  emit({ type: "assistant", message: { role: "assistant", content: [
+    { type: "tool_use", id: "ask1", name: "mcp__pi_subagents__caller_ping", input: { question: "Which one?" } },
+  ] } });
+  emit({ type: "user", message: { role: "user", content: [
+    { type: "tool_result", tool_use_id: "ask1", content: [{ type: "text", text: "Question sent to your caller." }], is_error: false },
+  ] } });
+  emit({ type: "result", subtype: "success", is_error: false, result: "Done", usage: { input_tokens: 10, output_tokens: 5 }, total_cost_usd: 0.01 });
+});
+`);
+	try {
+		const events = await collect(streamClaudeTurn(MODEL, userContext("go"), undefined, CONFIG));
+		const done = events.at(-1);
+		assert.equal(done.reason, "stop");
+		assert.ok(!claude.calls()[0].argv.includes("--mcp-config"), "no ask server outside a subagent");
+		const text = textOf(done.message);
+		assert.ok(text.includes("▸ mcp__pi_subagents__caller_ping"), "the ask is just another activity line here");
+		assert.deepEqual(done.message.content.filter((c: any) => c.type === "toolCall"), [], "and it is not a pi tool call");
+	} finally {
+		claude.restore();
+		fs.rmSync(directory, { recursive: true, force: true });
+	}
+});
+
+askBridgeTest("inside a subagent run an ask is a real tool call, the child parks, and the answer completes it", async () => {
+	const scratch = fs.mkdtempSync(path.join(os.tmpdir(), "provider-ask-test-"));
+	const runDir = fs.mkdtempSync(path.join(os.tmpdir(), "provider-ask-run-"));
+	const claude = stubClaude(scratch, FAKE_CLAUDE_ASK);
+	const config = { ...CONFIG, subagentRunDir: runDir, askServerPath: ASK_SERVER_PATH };
+	try {
+		// Request 1: claude asks; the driver surfaces the ask and parks the child.
+		const r1 = await collect(streamClaudeTurn(MODEL, userContext("map auth"), undefined, config));
+		const done1 = r1.at(-1);
+		assert.equal(done1.type, "done");
+		assert.equal(done1.reason, "toolUse", "the ask ends the request the way a tool call does");
+		assert.equal(done1.message.stopReason, "toolUse");
+		const ask = done1.message.content.find((c: any) => c.type === "toolCall");
+		assert.ok(ask, "the ask travels as a pi tool call");
+		assert.equal(ask.id, "ask1", "claude's own tool_use id, so pi's tool result matches");
+		assert.equal(ask.name, "caller_ping", "pi's tool name, not the mangled MCP one");
+		assert.equal(ask.arguments.question, "Which auth module should I map first?");
+		assert.equal(done1.message.usage.totalTokens, 0, "the ask turn's tokens are accounted when its result replays");
+		assert.ok(!textOf(done1.message).includes("Question sent"), "the ask's own tool result is not double-recorded");
+
+		const parked = parkedAsks.get(runDir);
+		assert.ok(parked, "the asking child is parked");
+		assert.equal(parked!.proc.exitCode, null, "still alive, holding its context");
+
+		// The spawn config: the ask server and its pre-approval, and none of the
+		// subagent plumbing leaking into the claude child's env.
+		const call1 = claude.calls()[0];
+		const mcpIdx = call1.argv.indexOf("--mcp-config");
+		const server = JSON.parse(call1.argv[mcpIdx + 1]).mcpServers.pi_subagents;
+		assert.equal(server.env.PI_SUBAGENT_RUN_DIR, runDir, "the ask server points at the run dir");
+		assert.ok(call1.argv.includes(ASK_TOOL), "the ask tool is pre-approved");
+		assert.equal(call1.subagentEnv, null, "PI_SUBAGENT_* is scrubbed from the claude child's env");
+
+		// Request 2: pi executed caller_ping; the continuation adopts the parked
+		// child and lets its closing turn replay into this request.
+		const r2 = await collect(streamClaudeTurn(MODEL, contextWith(ASK_TURN), undefined, config));
+		const done2 = r2.at(-1);
+		assert.equal(done2.type, "done");
+		assert.equal(done2.reason, "stop");
+		assert.ok(textOf(done2.message).includes("Asked my caller and will wait for the answer."));
+		assert.deepEqual(done2.message.usage, {
+			input: 150, output: 25, cacheRead: 5, cacheWrite: 0, totalTokens: 180,
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0.02 },
+		}, "the ask turn's result usage is authoritative for the continuation");
+		assert.equal(parkedAsks.get(runDir), parked, "the same child is still parked");
+		assert.equal(parked!.proc.exitCode, null, "the child survives the continuation: the answer is still coming");
+
+		// Request 3: the parent's answer arrives as a user message; the driver
+		// routes it into the parked child's stdin.
+		const r3 = await collect(streamClaudeTurn(MODEL, contextWith([
+			...ASK_TURN,
+			{ role: "user", content: ANSWER, timestamp: 4 } as Message,
+		]), undefined, config));
+		const done3 = r3.at(-1);
+		assert.equal(done3.type, "done");
+		assert.equal(done3.reason, "stop");
+		assert.ok(textOf(done3.message).includes("Answered: Your caller answered: map src/auth.ts first."), `got: ${JSON.stringify(textOf(done3.message))}`);
+		assert.deepEqual(done3.message.usage, {
+			input: 300, output: 40, cacheRead: 10, cacheWrite: 0, totalTokens: 350,
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0.03 },
+		});
+
+		// One claude process served all three turns: the answer reached the
+		// process that asked, not a fresh spawn.
+		assert.equal(claude.calls().filter((c: any) => c.boot).length, 1);
+		assert.ok(claude.calls().some((c: any) => c.stdin === ANSWER), "the parked child received the answer over stdin");
+
+		// The delivery is recorded for the ask server's one-question bookkeeping.
+		const answers = fs.readFileSync(path.join(runDir, "answers.jsonl"), "utf-8").trim().split("\n").filter(Boolean);
+		assert.ok(answers.length >= 1, "the delivery marker was appended to answers.jsonl");
+	} finally {
+		for (const session of [...parkedAsks.values()]) { try { session.proc.kill("SIGTERM"); } catch { /* already gone */ } }
+		parkedAsks.clear();
+		claude.restore();
+		fs.rmSync(scratch, { recursive: true, force: true });
+		fs.rmSync(runDir, { recursive: true, force: true });
+	}
+});
+
+askBridgeTest("an abort during an attached turn kills the parked child and clears the park", async () => {
+	const scratch = fs.mkdtempSync(path.join(os.tmpdir(), "provider-ask-abort-test-"));
+	const runDir = fs.mkdtempSync(path.join(os.tmpdir(), "provider-ask-abort-run-"));
+	const oldSlow = process.env.FAKE_CLAUDE_SLOW;
+	process.env.FAKE_CLAUDE_SLOW = "1";
+	const claude = stubClaude(scratch, FAKE_CLAUDE_ASK);
+	const config = { ...CONFIG, subagentRunDir: runDir, askServerPath: ASK_SERVER_PATH };
+	try {
+		const r1 = await collect(streamClaudeTurn(MODEL, userContext("map auth"), undefined, config));
+		assert.equal(r1.at(-1).reason, "toolUse");
+		assert.ok(parkedAsks.has(runDir));
+
+		const control = new AbortController();
+		const stream2 = streamClaudeTurn(MODEL, contextWith(ASK_TURN), { signal: control.signal } as any, config);
+		const collected = collect(stream2);
+		await new Promise((r) => setTimeout(r, 120));
+		control.abort();
+		const events = await collected;
+		assert.equal(events.at(-1).type, "error");
+		assert.equal(events.at(-1).reason, "aborted");
+		await waitUntil(() => !parkedAsks.has(runDir), 2000);
+	} finally {
+		for (const session of [...parkedAsks.values()]) { try { session.proc.kill("SIGTERM"); } catch { /* already gone */ } }
+		parkedAsks.clear();
+		if (oldSlow === undefined) delete process.env.FAKE_CLAUDE_SLOW; else process.env.FAKE_CLAUDE_SLOW = oldSlow;
+		claude.restore();
+		fs.rmSync(scratch, { recursive: true, force: true });
+		fs.rmSync(runDir, { recursive: true, force: true });
+	}
 });
