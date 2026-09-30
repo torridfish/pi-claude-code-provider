@@ -10,7 +10,7 @@ Each request spawns a fresh `claude -p` child and hands it pi's transcript as on
 
 Deliberate stage-one edges:
 
-- **Claude's tool calls are activity lines, not pi tool calls.** Emitting a pi `toolCall` would make pi execute a tool that belongs to the claude harness. Claude's own tool use (`▸ Read src/auth.ts`, its results) is visible in the streamed text instead. A later stage can relay tool calls back through an MCP bridge if pi is to own tool execution.
+- **Claude's tool calls are activity lines, not pi tool calls.** Emitting a pi `toolCall` would make pi execute a tool that belongs to the claude harness. Claude's own tool use (`▸ Read src/auth.ts`, its results) is visible in the streamed text instead. A later stage can relay tool calls back through an MCP bridge if pi is to own tool execution. The one exception is the ask bridge below: `caller_ping` is the child pi's own tool, not one of claude's.
 - **A fresh child per request.** Claude Code's prompt cache absorbs most of the repeated transcript cost, but a turn re-pays the harness's own system prompt. Cost metadata reflects the underlying Anthropic prices.
 - **Text only.** Images are acknowledged in the transcript, not sent.
 - **Thinking maps to `--effort`** (`off`/`minimal` floor at `low`).
@@ -41,8 +41,24 @@ Environment variables, read when the provider is registered:
 | `CLAUDE_CODE_PROVIDER_COMMAND` | `claude` | The binary to run (resolved on PATH). |
 | `CLAUDE_CODE_PROVIDER_TOOLS` | `Read,Grep,Glob,WebSearch,WebFetch` | The child's `--allowedTools` — what a headless turn may do without a human prompt. Read-only by default on purpose: widening it means claude's `Edit`/`Write`/`Bash` run unattended inside pi's turns. |
 | `CLAUDE_CODE_PROVIDER_MAX_BUDGET_USD` | unset | A hard ceiling per request, passed as `--max-budget-usd`. |
+| `CLAUDE_CODE_PROVIDER_ASK_SERVER` | sibling checkout | Where the ask MCP server lives (see below); the bridge is off when it cannot be found. |
 
 Models: the catalog is **read out of your Claude Code installation at startup** — every alias and every exact model id the installed CLI accepts (`fable`, `opus`, `claude-sonnet-4-5-20250929`, the `[1m]` long-context spellings, …), so pinning a precise version is picking a row, not editing config. The refresh scans the binary the shim resolves to (read-only, a few hundred ms) and degrades to the four latest-model aliases when the binary cannot be read or its catalog format has changed. Cost figures are a family heuristic — the binary carries no prices.
+
+## Asking its caller (the pi-subagents bridge)
+
+Inside a [pi-subagents-herdr](../pi-subagents-herdr) child — a run whose model is this provider — claude can ask the agent that dispatched it a question, the same way the dedicated claude runner can. The run dir (`PI_SUBAGENT_RUN_DIR`) is captured when the provider loads; the child extension scrubs it from the environment on `session_start`, but the provider serves this session itself and needs the value for its whole life.
+
+The mechanics, per ask:
+
+1. The driver spawns claude with the run's ask MCP server (`--mcp-config`, pre-approved under its mangled MCP name) and none of the `PI_SUBAGENT_*` variables in claude's own env.
+2. When claude's stream shows a `caller_ping` call, it is surfaced as a **real pi tool call** — the one tool that breaks the no-toolCall rule, because executing it is how the question reaches the parent. The request ends with a `toolUse` stop reason; pi's loop executes its own `caller_ping` and parks the child session.
+3. The claude process that asked is **parked, not killed**: its stdin stays open and its in-process context — everything it did that pi's transcript never saw — survives. Stream events that arrive with no request to consume them are buffered.
+4. The next request adopts the parked child. Right after the tool result it carries no new message: the child finishes its ask turn on its own and the buffered events replay into that request. When the parent's answer arrives (a later user message), the driver writes just that text into the parked child's stdin — and appends the delivery marker to `answers.jsonl`, which the parent does for its own runner children but not for pi ones — and the child's completion streams as that turn's assistant message. Further asks repeat the cycle in the same process.
+
+The parked child dies with the run: an aborted request kills it, and the provider process exiting SIGTERMs whatever is still parked. A run picked back up after a restart has no parked child and falls back to the fresh-spawn-per-request behavior, continuing from the serialized transcript.
+
+The ask server path is the sibling checkout's `runners/claude-ask.mjs` (one implementation of the ask protocol for both consumers), overridable with `CLAUDE_CODE_PROVIDER_ASK_SERVER`; without it the bridge stays off.
 
 ## Authentication and compliance
 
@@ -59,4 +75,4 @@ npm test              # unit tests, against a stand-in child; no usage
 
 - **Tool relay** (stage two): disable claude's own tools, expose pi's through an MCP bridge, and let pi execute — approval UI, sandbox and tool-call rendering all become pi's.
 - **Steering across turns**: queue a mid-turn user message into the running child's stdin instead of waiting for the request to settle.
-- **Integration with pi-subagents-herdr**: a pane child can run with this as its model (`models: { scout: "claude-code/claude-sonnet-5" }`), replacing the dedicated claude runner for agents that want claude's harness behind pi's interface.
+- **Integration with pi-subagents-herdr**: a pane child can run with this as its model (`models: { scout: "claude-code/claude-sonnet-5" }`), replacing the dedicated claude runner for agents that want claude's harness behind pi's interface. The ask bridge is in; what remains is the rest of the runner surface (progress shaping, tool display).
