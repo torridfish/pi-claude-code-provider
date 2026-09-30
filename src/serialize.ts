@@ -31,7 +31,9 @@ function truncate(text: string, limit: number): string {
 	return text.slice(0, limit - 1) + "…";
 }
 
-function flatten(content: unknown): string {
+/** Text content, flattened — the driver uses it to lift a pi user message
+ *  (the parent's answer) out of the transcript for the parked claude child. */
+export function flattenText(content: unknown): string {
 	if (typeof content === "string") return content;
 	if (Array.isArray(content)) {
 		return content
@@ -45,7 +47,7 @@ function flatten(content: unknown): string {
 export function serializeMessage(message: Message): string | undefined {
 	if (message.role === "system") return undefined;
 	if (message.role === "user") {
-		const text = flatten(message.content);
+		const text = flattenText(message.content);
 		const images = Array.isArray(message.content) ? message.content.filter((c: any) => c.type === "image").length : 0;
 		const parts = [text.trim() && `[user]: ${truncate(text.trim(), RESULT_LIMIT)}`];
 		if (images) parts.push(`[user attached ${images} image${images === 1 ? "" : "s"} — not reproduced in this transcript]`);
@@ -65,7 +67,7 @@ export function serializeMessage(message: Message): string | undefined {
 		return parts.join("\n") || undefined;
 	}
 	if (message.role === "toolResult") {
-		const text = truncate(flatten(message.content), RESULT_LIMIT);
+		const text = truncate(flattenText(message.content), RESULT_LIMIT);
 		if (!text.trim()) return undefined;
 		return `[tool ${message.toolName} ${message.isError ? "error" : "result"}]: ${text}`;
 	}
