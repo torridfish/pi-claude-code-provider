@@ -47,7 +47,7 @@ Models: the catalog is **read out of your Claude Code installation at startup** 
 
 ## Asking its caller (the pi-subagents bridge)
 
-Inside a [pi-subagents-herdr](../pi-subagents-herdr) child — a run whose model is this provider — claude can ask the agent that dispatched it a question, the same way the dedicated claude runner can. The run dir (`PI_SUBAGENT_RUN_DIR`) is captured when the provider loads; the child extension scrubs it from the environment on `session_start`, but the provider serves this session itself and needs the value for its whole life.
+Inside a [pi-subagents-herdr](https://github.com/torridfish/pi-subagents-herdr) child — a run whose model is this provider — claude can ask the agent that dispatched it a question, the same way any child can. The run dir (`PI_SUBAGENT_RUN_DIR`) is captured when the provider loads; the child extension scrubs it from the environment on `session_start`, but the provider serves this session itself and needs the value for its whole life.
 
 The mechanics, per ask:
 
