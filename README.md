@@ -71,8 +71,20 @@ npm run typecheck
 npm test              # unit tests, against a stand-in child; no usage
 ```
 
+## The tool relay (pi's tools, executed by pi)
+
+Inside a pi-subagents run dir the provider arms a second MCP sidecar, `pi_relay`, that serves the child pi's ACTIVE tools (its `--tools` allowlist, minus `caller_ping`, which the ask bridge owns) to claude under namespaced names (`mcp__pi_relay__read`, …). The mechanics, per call:
+
+1. The driver publishes the catalog — name, description (pi's prompt guidelines folded in), parameter schema — to `<runDir>/relay-tools.json` before spawning claude, and pre-approves every relayed tool in `--allowedTools`.
+2. When claude's stream shows a relayed `tool_use` block, the driver surfaces it as a REAL pi tool call — pi's loop executes it the way it executes its own, auto-approved in a headless child — and the turn ends with `toolUse`, exactly like the ask.
+3. The next request's transcript carries the `toolResult`; the driver drops it into `<runDir>/relay-res/`, where the sidecar — still blocked in the `tools/call` it received from claude — finds it by the (tool, arguments) key both sides hash, and answers.
+4. Claude's turn continues in the same process, replaying into the request that delivered the result.
+
+The relay is ADDITIVE: claude keeps its own harness tools and its built-in read-only Bash set, and reaches for whichever tool fits. That is the point — an agent's declared tool list becomes authoritative for what EXTRA surface claude gets (`subagent`, `write`, custom extension tools, pi's `web_search`), while the harness's strengths stay native. Overlapping pairs (`Read` vs relayed `read`) coexist; claude prefers its own.
+
+Display follows execution: relayed calls render as ordinary pi tool rows in the herdr pane; claude's own tools remain activity lines.
+
 ## Roadmap
 
-- **Tool relay** (stage two): disable claude's own tools, expose pi's through an MCP bridge, and let pi execute — approval UI, sandbox and tool-call rendering all become pi's.
 - **Steering across turns**: queue a mid-turn user message into the running child's stdin instead of waiting for the request to settle.
-- **Integration with pi-subagents-herdr**: a pane child can run with this as its model (`models: { scout: "claude-code/claude-sonnet-5" }`), replacing the dedicated claude runner for agents that want claude's harness behind pi's interface. The ask bridge is in; what remains is the rest of the runner surface (progress shaping, tool display).
+- **Integration with pi-subagents-herdr**: a pane child can run with this as its model (`models: { scout: "claude-code/claude-sonnet-5" }`), replacing the dedicated claude runner for agents that want claude's harness behind pi's interface. The ask bridge and the tool relay are in; what remains is progress shaping for claude's own (non-relayed) tool activity.
