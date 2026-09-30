@@ -21,11 +21,16 @@
  *    harness's own system prompt.
  *  - Images are described, not sent. The CLI's stream-json user message
  *    carries text only here.
+ *  - One exception to "no pi tool calls": inside a pi-subagents child the ask
+ *    bridge surfaces claude's caller_ping as a real tool call and keeps the
+ *    asking claude process parked until the parent's answer arrives — the
+ *    ask flows to the parent through the child pi's own channel.
  */
 import type { ExtensionAPI, ProviderModelConfig } from "@earendil-works/pi-coding-agent";
 import type { Api, Model, SimpleStreamOptions, TranscriptContext } from "@earendil-works/pi-ai/compat";
 import { getCurrentSystemPrompt } from "@earendil-works/pi-ai/utils/transcript";
 import { buildCatalog, resolveClaudeBinary } from "./src/catalog.ts";
+import { resolveAskServerPath } from "./src/ask.ts";
 import { DEFAULT_TOOLS, streamClaudeTurn, type ClaudeDriverConfig } from "./src/driver.ts";
 import { serializeTranscript } from "./src/serialize.ts";
 
@@ -51,6 +56,18 @@ export const MODELS: ProviderModel[] = [
 	{ id: "haiku", name: "Claude Code · Haiku (latest)", contextWindow: 200_000, maxTokens: 8192, input: 1, output: 5 },
 ];
 
+/** The pi-subagents run dir this process serves, when it runs as a subagent
+ *  child, captured at module load. It cannot be re-read per request:
+ *  herdr/child.ts deletes PI_SUBAGENT_RUN_DIR from the environment on
+ *  session_start so its own descendants never write into the parent's run
+ *  dir — but the provider serves this session itself and needs the value for
+ *  the session's whole life, including every turn after that scrub. Outside
+ *  a subagent child this is undefined and every path below stays inert. */
+const SUBAGENT_RUN_DIR = process.env.PI_SUBAGENT_RUN_DIR;
+/** Resolved once, for the same reason. Undefined when there is no run dir or
+ *  the ask server cannot be located — the bridge is off in either case. */
+const ASK_SERVER_PATH = SUBAGENT_RUN_DIR ? resolveAskServerPath() : undefined;
+
 export function resolveConfig(): ClaudeDriverConfig {
 	const command = process.env.CLAUDE_CODE_PROVIDER_COMMAND || "claude";
 	const tools = (process.env.CLAUDE_CODE_PROVIDER_TOOLS || DEFAULT_TOOLS.join(","))
@@ -61,6 +78,8 @@ export function resolveConfig(): ClaudeDriverConfig {
 		allowedTools: tools,
 		includePartialMessages: true,
 		maxBudgetUsd: Number.isFinite(budget) && budget > 0 ? budget : undefined,
+		subagentRunDir: SUBAGENT_RUN_DIR,
+		askServerPath: ASK_SERVER_PATH,
 	};
 }
 
