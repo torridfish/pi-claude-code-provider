@@ -2,11 +2,19 @@
  * Drive one turn of `claude -p` and adapt its stream onto pi's message-event
  * protocol.
  *
- * Each request to this provider is one conversation turn: the child is spawned
- * fresh, handed the serialized transcript as its only user message, and read
- * until its `result` event. Claude Code executes its own tools inside that
- * turn — the harness is the point of going through the CLI — and what comes
- * back is text.
+ * A request to this provider is one conversation turn. Outside a subagent run
+ * the child is spawned fresh per request, handed the serialized transcript as
+ * its only user message, and read until its `result` event; inside one it is
+ * resident for the run's life (see below). Claude Code executes its own tools
+ * inside that turn — the harness is the point of going through the CLI — and
+ * what comes back is text.
+ *
+ * Outside a run dir the fresh spawn is load-bearing, not incidental: pi can
+ * rewrite its transcript between requests (compaction, branch, undo), and a
+ * child that re-reads the transcript each turn is always exactly where the
+ * transcript says it is. A resident child carries its own in-process context,
+ * which pi cannot rewind. A subagent run is append-only in practice, which is
+ * what makes residency safe there.
  *
  * What is deliberately NOT mapped onto pi: tool calls. Emitting a toolCall
  * block would make pi execute it, and the tool it names belongs to Claude
@@ -20,13 +28,25 @@
  * harness) — pi executing it is how the question reaches the parent. The
  * claude process that asked is then parked, not killed: its stdin stays open
  * so its in-process context survives, and the request that carries the
- * parent's answer adopts it and feeds the answer in. See `ParkedSession`.
+ * parent's answer adopts it and feeds the answer in. See `Session`.
+ *
+ * The park is the general rule, not the ask's special case: inside a run dir
+ * every spawned child stays resident after its request settles, and every
+ * later request of the run adopts it — delivering only the messages it has
+ * yet to see. The transcript is re-serialized exactly once, on the first
+ * spawn; each later turn costs the turn itself, not the harness system
+ * prompt plus the whole history again. A run picked back up after a restart
+ * finds no resident child and joins the claude session the first leg recorded
+ * (`--resume`, the id kept in the run dir) rather than starting over; only a
+ * claude whose own store no longer has that session falls back to a fresh
+ * conversation with the full transcript.
  *
  * Compliance note: the binary is spawned unmodified, auth is its own, and
  * `-p` with stream-json is Claude Code's documented headless interface.
  */
 import { spawn } from "node:child_process";
 import type { ChildProcess } from "node:child_process";
+import * as crypto from "node:crypto";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import type {
@@ -51,7 +71,13 @@ import { flattenText, serializeTranscript } from "./serialize.ts";
 /** The standard built-in set a headless child is pre-approved to use. Read
  *  -only on purpose: a provider that writes and runs shell commands without
  *  pi's approval flow in the way is a decision for whoever sets this, not a
- *  default. CLAUDE_CODE_PROVIDER_TOOLS widens it. */
+ *  default. CLAUDE_CODE_PROVIDER_TOOLS widens it.
+ *
+ *  The effective surface is this list plus Claude Code's built-in set of
+ *  read-only Bash commands (`ls`, `cat`, `grep`, `find`, read-only `git`,
+ *  …), which run without a permission prompt in every mode and are not
+ *  configurable — `--allowedTools` never gates them. `--permission-prompts
+ *  none` denies everything else that would prompt; it allows nothing. */
 export const DEFAULT_TOOLS = ["Read", "Grep", "Glob", "WebSearch", "WebFetch"];
 
 export interface ClaudeDriverConfig {
@@ -93,7 +119,7 @@ export function resolveEffort(reasoning: string | undefined): string | undefined
 }
 
 /** The child's argv, exported for tests: this is the contract with the CLI. */
-export function buildClaudeCodeArgs(model: string, effort: string | undefined, systemPrompt: string, config: ClaudeDriverConfig): string[] {
+export function buildClaudeCodeArgs(model: string, effort: string | undefined, systemPrompt: string, config: ClaudeDriverConfig, sessionId?: string, resume = false): string[] {
 	// The ask bridge exists only when both halves are configured; either alone
 	// would name a tool no server answers.
 	const askBridge = !!(config.subagentRunDir && config.askServerPath);
@@ -111,6 +137,10 @@ export function buildClaudeCodeArgs(model: string, effort: string | undefined, s
 		// "no tools at all", spelled explicitly.
 		"--allowedTools", ...(allowed.length > 0 ? allowed : [""]),
 	];
+	// The id-spelling the dedicated claude runner also uses: a run names its
+	// conversation at first spawn and joins it by id when picked back up. Left
+	// off outside a run dir, where the child is fresh per request by design.
+	if (sessionId) args.push(resume ? "--resume" : "--session-id", sessionId);
 	if (askBridge) {
 		// The same shape runners/claude.ts passes: one inline server definition,
 		// with the run directory spelled out because the claude child's own env
@@ -155,10 +185,10 @@ function describeResult(evt: any): string {
 // the park can. A run picked back up after a restart finds no park and falls
 // back to a fresh spawn reading the full serialized transcript.
 
-/** Parked claude children by run dir. Exported for tests and for cleanup. */
-export const parkedAsks = new Map<string, ParkedSession>();
+/** Resident claude children by run dir. Exported for tests and for cleanup. */
+export const residentSessions = new Map<string, Session>();
 
-class ParkedSession {
+class Session {
 	readonly proc: ChildProcess;
 	readonly runDir: string;
 	/** The tool_use id of the ask this session surfaced to pi; the request that
@@ -180,12 +210,12 @@ class ParkedSession {
 	constructor(proc: ChildProcess, runDir: string) {
 		this.proc = proc;
 		this.runDir = runDir;
-		parkedAsks.set(runDir, this);
+		residentSessions.set(runDir, this);
 	}
 }
 
-/** Whether a parked child can still be adopted by an incoming request. */
-function adoptable(session: ParkedSession): boolean {
+/** Whether a resident child can still be adopted by an incoming request. */
+function adoptable(session: Session): boolean {
 	return !session.exited && !session.stdinClosed
 		&& session.proc.exitCode === null && !session.proc.signalCode;
 }
@@ -194,9 +224,10 @@ let exitHookInstalled = false;
 function installExitHook() {
 	if (exitHookInstalled) return;
 	exitHookInstalled = true;
-	// The parked child outlives every request; it dies when the pi child does.
+	// The resident child outlives every request; it dies when the pi child
+	// does.
 	process.on("exit", () => {
-		for (const session of parkedAsks.values()) {
+		for (const session of residentSessions.values()) {
 			try { session.proc.kill("SIGTERM"); } catch { /* already gone */ }
 		}
 	});
@@ -216,6 +247,29 @@ function recordDelivery(runDir: string) {
  *  claude runner writes it. */
 function userMessage(text: string): string {
 	return JSON.stringify({ type: "user", message: { role: "user", content: [{ type: "text", text }] } }) + "\n";
+}
+
+// ── The claude session id ─────────────────────────────────────────
+//
+// A run records the id its first spawn named in the run dir, where the
+// relaunched provider process of a picked-back-up run finds it. Same shape
+// as the dedicated runner's `--session-id` argv: `--session-id` names a new
+// conversation, `--resume` joins the one the id already names.
+
+const SESSION_FILE = "claude-session-id";
+/** How long a resume probe waits for the child's first stdout line before
+ *  concluding it is alive (a child still starting up) rather than dead. */
+const RESUME_PROBE_MS = 3000;
+
+function readSessionId(runDir: string): string | undefined {
+	try {
+		const id = fs.readFileSync(path.join(runDir, SESSION_FILE), "utf8").trim();
+		return id || undefined;
+	} catch { return undefined; }
+}
+
+function writeSessionId(runDir: string, id: string): void {
+	try { fs.writeFileSync(path.join(runDir, SESSION_FILE), id + "\n", { mode: 0o600 }); } catch { /* a failed record costs only the resume path */ }
 }
 
 // ── One request's view of the turn ────────────────────────────────────
@@ -239,6 +293,10 @@ interface Turn {
 	/** Terminate with an error: close the child's stdin, land the error on the
 	 *  stream. Idempotent, like finish. */
 	finishError(errorMessage: string, reason: "aborted" | "error"): void;
+	/** Undo this turn's abort subscription without terminating anything: a
+	 *  discarded attempt's listeners must not fire into the retry that replaces
+	 *  it. */
+	discard(): void;
 }
 
 /**
@@ -252,7 +310,7 @@ function createTurn(
 	stream: AssistantMessageEventStream,
 	options: SimpleStreamOptions | undefined,
 	proc: ChildProcess | null,
-	session: ParkedSession | null,
+	session: Session | null,
 	keepChildOnStop: boolean,
 ): Turn {
 	const message: AssistantMessage = {
@@ -319,7 +377,7 @@ function createTurn(
 	const onAbort = () => {
 		aborted = true;
 		try { proc?.kill("SIGTERM"); } catch { /* already gone */ }
-		if (session && parkedAsks.get(session.runDir) === session) parkedAsks.delete(session.runDir);
+		if (session && residentSessions.get(session.runDir) === session) residentSessions.delete(session.runDir);
 	};
 	const detachAbort = () => options?.signal?.removeEventListener("abort", onAbort);
 	options?.signal?.addEventListener("abort", onAbort, { once: true });
@@ -365,12 +423,13 @@ function createTurn(
 		addActivity,
 		finish,
 		finishError,
+		discard: detachAbort,
 	};
 }
 
 /** Surface a `caller_ping` call as a real pi tool call: the one toolUse this
  *  provider lets pi execute, because the tool is the child pi's own. */
-function surfaceAsk(turn: Turn, session: ParkedSession, block: any): void {
+function surfaceAsk(turn: Turn, session: Session, block: any): void {
 	turn.closeBlock("text");
 	turn.closeBlock("thinking");
 	const toolCall: ToolCall = {
@@ -400,7 +459,7 @@ function surfaceAsk(turn: Turn, session: ParkedSession, block: any): void {
  * all hang off `session` — null outside a run dir, where behavior is exactly
  * the stage-one one.
  */
-function applyEvent(evt: any, turn: Turn, session: ParkedSession | null, config: ClaudeDriverConfig): void {
+function applyEvent(evt: any, turn: Turn, session: Session | null, config: ClaudeDriverConfig): void {
 	// Live deltas, when the CLI was asked for partial messages. The complete
 	// assistant messages that follow are then read only for their tool_use
 	// blocks.
@@ -490,17 +549,19 @@ function applyEvent(evt: any, turn: Turn, session: ParkedSession | null, config:
 }
 
 /**
- * Adopt a parked child for an incoming request.
+ * Adopt a resident child for an incoming request.
  *
- * The request is one of two things: the continuation pi's loop makes right
+ * The request is one of three things: the continuation pi's loop makes right
  * after executing its own `caller_ping` (its transcript ends with the matching
  * toolResult and carries no new message — the child is finishing its ask turn
- * on its own), or the parent's answer, arrived as a user message while the
- * child sits parked. Both attach to the same process; only the answer writes
- * to its stdin.
+ * on its own), a message meant for the child — the parent's answer to a
+ * parked ask, a steered message, the next turn's prompt — arrived as a user
+ * message, or a replay of events the child emitted before this request
+ * attached. All three attach to the same process; only the message writes to
+ * its stdin.
  */
-function attachParked(
-	session: ParkedSession,
+function attachSession(
+	session: Session,
 	model: Model<Api>,
 	context: TranscriptContext,
 	options: SimpleStreamOptions | undefined,
@@ -520,7 +581,7 @@ function attachParked(
 	if (!deliver && session.idle && session.buffer.length === 0) {
 		// An idle child streams nothing until its stdin gets a message; without
 		// one this request could only hang.
-		turn.finishError("the parked claude child is waiting for a message and this request carries none to deliver", "error");
+		turn.finishError("the resident claude child is waiting for a message and this request carries none to deliver", "error");
 		return;
 	}
 	// No payload hook on an adopted child: nothing travels to claude but the
@@ -557,107 +618,168 @@ export function streamClaudeTurn(
 ): AssistantMessageEventStream {
 	const stream = createAssistantMessageEventStream();
 	void (async () => {
-		// Inside a subagent run, a parked child is the request's real backend:
-		// the answer must reach the process that asked, not a fresh one.
-		const bridged = !!(config.subagentRunDir && config.askServerPath);
-		if (bridged) {
-			const session = parkedAsks.get(config.subagentRunDir!);
+		// Inside a subagent run, a resident child is the request's real backend:
+		// the turn must reach the process that holds the conversation, not a
+		// fresh one.
+		const inRun = !!config.subagentRunDir;
+		if (inRun) {
+			const session = residentSessions.get(config.subagentRunDir!);
 			if (session && adoptable(session)) {
-				attachParked(session, model, context, options, config, stream);
+				attachSession(session, model, context, options, config, stream);
 				return;
 			}
 		}
 
 		let proc: ChildProcess;
-		let session: ParkedSession | null = null;
+		let session: Session | null = null;
 		let turn: Turn;
 		try {
 			const systemPrompt = getCurrentSystemPrompt(context.messages);
 			const effort = resolveEffort(options?.reasoning);
-			const argv = buildClaudeCodeArgs(model.id, effort, systemPrompt, config);
-			const payload = serializeTranscript(context.messages);
-			// Request inspection, honored the way a custom stream must: the hook
-			// sees what would be sent, and a replacement payload becomes the
-			// message that actually travels.
-			let finalPayload = payload;
-			if (options?.onPayload) {
-				const replacement = await options.onPayload(
-					{ provider: "claude-code", model: model.id, cwd: process.cwd(), argv, message: payload },
-					model,
-				);
-				if (typeof replacement === "string") finalPayload = replacement;
+			const fullPayload = serializeTranscript(context.messages);
+			// Inside a run dir the child persists its conversation under a stable
+			// id, recorded in the run dir: the first spawn names it, and a run
+			// picked back up after a restart joins it instead of starting over.
+			const recorded = inRun ? readSessionId(config.subagentRunDir!) : undefined;
+			const resume = !!recorded;
+			const sessionId = inRun ? recorded ?? crypto.randomUUID() : undefined;
+			if (inRun && !recorded) writeSessionId(config.subagentRunDir!, sessionId!);
+			// A resumed child already holds everything up to its persistence
+			// boundary; only what it has yet to see travels. That is the trailing
+			// user message when there is one, and the full transcript otherwise
+			// (a tail the child cannot be summed up against).
+			let payload = fullPayload;
+			if (resume) {
+				const last = context.messages.at(-1);
+				const text = last?.role === "user" ? flattenText(last.content) : "";
+				if (text.trim()) payload = text;
 			}
 			// The claude child is told none of the subagent plumbing:
 			// PI_SUBAGENT_* would let its own descendants write into the run
 			// dir. The ask server gets the run dir explicitly, via --mcp-config.
 			let spawnOptions: Parameters<typeof spawn>[2] = { cwd: process.cwd(), stdio: ["pipe", "pipe", "pipe"] };
-			if (bridged) {
+			if (inRun) {
 				const env = { ...process.env };
 				for (const key of Object.keys(env)) {
 					if (key.startsWith("PI_SUBAGENT_")) delete env[key];
 				}
 				spawnOptions = { ...spawnOptions, env };
 			}
-			proc = spawn(config.command, argv, spawnOptions);
-			// onResponse matches built-in providers' contract: after the response
-			// exists, before its body is consumed. A subprocess has no HTTP
-			// response to inspect, so the hook gets the synthetic 200.
-			if (options?.onResponse) options.onResponse({ status: 200, headers: {} }, model);
-			proc.stdin?.on("error", () => {});
-			if (bridged) {
-				session = new ParkedSession(proc, config.subagentRunDir!);
-				installExitHook();
-			}
-			turn = createTurn(model, stream, options, proc, session, false);
-			if (session) session.sink = turn;
-			proc.stdin?.write(JSON.stringify({ type: "user", message: { role: "user", content: [{ type: "text", text: finalPayload }] } }) + "\n");
 
-			let lineBuf = "";
-			let stderrTail = "";
-			proc.stdout?.on("data", (d: Buffer) => {
-				lineBuf += d.toString();
-				const lines = lineBuf.split("\n");
-				lineBuf = lines.pop() || "";
-				for (const line of lines) {
-					if (!line.trim()) continue;
-					let evt: any;
-					try { evt = JSON.parse(line); } catch { continue; }
-					const sink = session ? session.sink : turn;
-					if (sink) applyEvent(evt, sink, session, config);
-					else if (session) session.buffer.push(evt);
+			// A resume claude cannot join (its own store no longer has the
+			// session) fails before reading anything; that attempt is discarded
+			// and the turn retried once as a fresh conversation with the full
+			// transcript — under a new id, so later pickups do not hit the same
+			// wall. Retrying before the stream has carried anything keeps the
+			// protocol intact: the model sees one turn, not an error then a turn.
+			for (let attempt = 1; ; attempt++) {
+				const useResume = resume && attempt === 1;
+				const sessionIdNow = attempt === 1 ? sessionId! : crypto.randomUUID();
+				if (attempt > 1 && resume) writeSessionId(config.subagentRunDir!, sessionIdNow);
+				const attemptPayload = attempt === 1 ? payload : fullPayload;
+				const argv = buildClaudeCodeArgs(model.id, effort, systemPrompt, config, sessionIdNow, useResume);
+				// Request inspection, honored the way a custom stream must: the hook
+				// sees what would be sent, and a replacement payload becomes the
+				// message that actually travels.
+				let finalPayload = attemptPayload;
+				if (options?.onPayload) {
+					const replacement = await options.onPayload(
+						{ provider: "claude-code", model: model.id, cwd: process.cwd(), argv, message: attemptPayload },
+						model,
+					);
+					if (typeof replacement === "string") finalPayload = replacement;
 				}
-			});
+				proc = spawn(config.command, argv, spawnOptions);
+				// onResponse matches built-in providers' contract: after the response
+				// exists, before its body is consumed. A subprocess has no HTTP
+				// response to inspect, so the hook gets the synthetic 200.
+				if (options?.onResponse) options.onResponse({ status: 200, headers: {} }, model);
+				// Set before the probe so a failed-resume close never reaches the
+				// live handlers below: the probe listener is attached first and flips
+				// this flag synchronously during the same close event.
+				let abandoned = false;
+				if (useResume) proc.once("close", () => { abandoned = true; });
+				proc.stdin?.on("error", () => {});
+				// A resident child outlives the request that spawned it — a later
+				// turn of the same run adopts it, and the provider process exiting
+				// SIGTERMs whatever is still open.
+				session = inRun ? new Session(proc, config.subagentRunDir!) : null;
+				if (session) installExitHook();
+				turn = createTurn(model, stream, options, proc, session, inRun);
+				if (session) session.sink = turn;
+				proc.stdin?.write(userMessage(finalPayload));
 
-			proc.stderr?.on("data", (d: Buffer) => {
-				const tail = ((session ? session.stderrTail : stderrTail) + d.toString()).slice(-2000);
-				if (session) session.stderrTail = tail;
-				else stderrTail = tail;
-			});
-
-			proc.on("error", (error) => {
-				if (session && parkedAsks.get(session.runDir) === session) parkedAsks.delete(session.runDir);
-				if (!turn.isFinished()) turn.finishError(error.message, "error");
-				turn.stream.end();
-			});
-
-			proc.on("close", (code) => {
-				if (session) {
-					session.exited = true;
-					if (parkedAsks.get(session.runDir) === session) parkedAsks.delete(session.runDir);
-				}
-				// An adopted request reads the child through the session; a parked
-				// one (nobody attached) has no turn to fail.
-				const live = session ? session.sink : turn;
-				if (!live) return;
-				if (!live.isFinished()) {
-					if (live.wasAborted()) live.finishError("Aborted", "aborted");
-					else {
-						const stderr = (session ? session.stderrTail : stderrTail).trim().split("\n").at(-1);
-						live.finishError(`Claude Code exited (code ${code}) before finishing${stderr ? `: ${stderr}` : ""}`, "error");
+				let lineBuf = "";
+				let stderrTail = "";
+				proc.stdout?.on("data", (d: Buffer) => {
+					lineBuf += d.toString();
+					const lines = lineBuf.split("\n");
+					lineBuf = lines.pop() || "";
+					for (const line of lines) {
+						if (!line.trim()) continue;
+						let evt: any;
+						try { evt = JSON.parse(line); } catch { continue; }
+						const sink = session ? session.sink : turn;
+						if (sink) applyEvent(evt, sink, session, config);
+						else if (session) session.buffer.push(evt);
 					}
+				});
+
+				proc.stderr?.on("data", (d: Buffer) => {
+					const tail = ((session ? session.stderrTail : stderrTail) + d.toString()).slice(-2000);
+					if (session) session.stderrTail = tail;
+					else stderrTail = tail;
+				});
+
+				proc.on("error", (error) => {
+					if (abandoned) return;
+					if (session && residentSessions.get(session.runDir) === session) residentSessions.delete(session.runDir);
+					if (!turn.isFinished()) turn.finishError(error.message, "error");
+					turn.stream.end();
+				});
+
+				proc.on("close", (code) => {
+					if (session) {
+						session.exited = true;
+						if (residentSessions.get(session.runDir) === session) residentSessions.delete(session.runDir);
+					}
+					if (abandoned) return;
+					// An adopted request reads the child through the session; a
+					// resident one (nobody attached) has no turn to fail.
+					const live = session ? session.sink : turn;
+					if (!live) return;
+					if (!live.isFinished()) {
+						if (live.wasAborted()) live.finishError("Aborted", "aborted");
+						else {
+							const stderr = (session ? session.stderrTail : stderrTail).trim().split("\n").at(-1);
+							live.finishError(`Claude Code exited (code ${code}) before finishing${stderr ? `: ${stderr}` : ""}`, "error");
+						}
+					}
+					live.stream.end();
+				});
+
+				if (!useResume) return;
+				// The resume probe: a child that dies before speaking cannot join
+				// its recorded session; anything else — a line of output, or a
+				// quiet-but-alive startup past the probe window — is a live one.
+				const died = new Promise<"exited">((resolve) => proc.once("close", () => resolve("exited")));
+				const spoke = new Promise<"spoke">((resolve) => proc.stdout?.once("data", () => resolve("spoke")));
+				const verdict = await Promise.race([
+					died,
+					spoke,
+					new Promise<"timeout">((resolve) => setTimeout(() => resolve("timeout"), RESUME_PROBE_MS)),
+				]);
+				if (verdict !== "exited") return;
+				if (turn.wasAborted()) {
+					turn.finishError("Aborted", "aborted");
+					turn.stream.end();
+					return;
 				}
-				live.stream.end();
-			});
+				abandoned = true;
+				turn.discard();
+				// Fall through: attempt 2 spawns fresh, under a new id, with the
+				// full transcript.
+			}
 		} catch (error) {
 			const failed: AssistantMessage = {
 				role: "assistant", content: [], api: model.api, provider: model.provider, model: model.id,

@@ -7,7 +7,7 @@ import { fileURLToPath } from "node:url";
 import { normalizeContext, type Message, type TranscriptContext } from "@earendil-works/pi-ai/compat";
 import { serializeTranscript, TRANSCRIPT_HEADER } from "../src/serialize.ts";
 import { ASK_PI_TOOL, ASK_TOOL } from "../src/ask.ts";
-import { buildClaudeCodeArgs, DEFAULT_TOOLS, parkedAsks, resolveEffort, streamClaudeTurn, type ClaudeDriverConfig } from "../src/driver.ts";
+import { buildClaudeCodeArgs, DEFAULT_TOOLS, residentSessions, resolveEffort, streamClaudeTurn, type ClaudeDriverConfig } from "../src/driver.ts";
 
 function zeroUsage() {
 	return { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } };
@@ -493,7 +493,7 @@ askBridgeTest("inside a subagent run an ask is a real tool call, the child parks
 		assert.equal(done1.message.usage.totalTokens, 0, "the ask turn's tokens are accounted when its result replays");
 		assert.ok(!textOf(done1.message).includes("Question sent"), "the ask's own tool result is not double-recorded");
 
-		const parked = parkedAsks.get(runDir);
+		const parked = residentSessions.get(runDir);
 		assert.ok(parked, "the asking child is parked");
 		assert.equal(parked!.proc.exitCode, null, "still alive, holding its context");
 
@@ -517,7 +517,7 @@ askBridgeTest("inside a subagent run an ask is a real tool call, the child parks
 			input: 150, output: 25, cacheRead: 5, cacheWrite: 0, totalTokens: 180,
 			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0.02 },
 		}, "the ask turn's result usage is authoritative for the continuation");
-		assert.equal(parkedAsks.get(runDir), parked, "the same child is still parked");
+		assert.equal(residentSessions.get(runDir), parked, "the same child is still parked");
 		assert.equal(parked!.proc.exitCode, null, "the child survives the continuation: the answer is still coming");
 
 		// Request 3: the parent's answer arrives as a user message; the driver
@@ -544,8 +544,8 @@ askBridgeTest("inside a subagent run an ask is a real tool call, the child parks
 		const answers = fs.readFileSync(path.join(runDir, "answers.jsonl"), "utf-8").trim().split("\n").filter(Boolean);
 		assert.ok(answers.length >= 1, "the delivery marker was appended to answers.jsonl");
 	} finally {
-		for (const session of [...parkedAsks.values()]) { try { session.proc.kill("SIGTERM"); } catch { /* already gone */ } }
-		parkedAsks.clear();
+		for (const session of [...residentSessions.values()]) { try { session.proc.kill("SIGTERM"); } catch { /* already gone */ } }
+		residentSessions.clear();
 		claude.restore();
 		fs.rmSync(scratch, { recursive: true, force: true });
 		fs.rmSync(runDir, { recursive: true, force: true });
@@ -562,7 +562,7 @@ askBridgeTest("an abort during an attached turn kills the parked child and clear
 	try {
 		const r1 = await collect(streamClaudeTurn(MODEL, userContext("map auth"), undefined, config));
 		assert.equal(r1.at(-1).reason, "toolUse");
-		assert.ok(parkedAsks.has(runDir));
+		assert.ok(residentSessions.has(runDir));
 
 		const control = new AbortController();
 		const stream2 = streamClaudeTurn(MODEL, contextWith(ASK_TURN), { signal: control.signal } as any, config);
@@ -572,13 +572,168 @@ askBridgeTest("an abort during an attached turn kills the parked child and clear
 		const events = await collected;
 		assert.equal(events.at(-1).type, "error");
 		assert.equal(events.at(-1).reason, "aborted");
-		await waitUntil(() => !parkedAsks.has(runDir), 2000);
+		await waitUntil(() => !residentSessions.has(runDir), 2000);
 	} finally {
-		for (const session of [...parkedAsks.values()]) { try { session.proc.kill("SIGTERM"); } catch { /* already gone */ } }
-		parkedAsks.clear();
+		for (const session of [...residentSessions.values()]) { try { session.proc.kill("SIGTERM"); } catch { /* already gone */ } }
+		residentSessions.clear();
 		if (oldSlow === undefined) delete process.env.FAKE_CLAUDE_SLOW; else process.env.FAKE_CLAUDE_SLOW = oldSlow;
 		claude.restore();
 		fs.rmSync(scratch, { recursive: true, force: true });
 		fs.rmSync(runDir, { recursive: true, force: true });
+	}
+});
+
+// ── Residency: one claude process per run ─────────────────────────────
+//
+// Inside a run dir the child stays resident after its request settles and
+// every later request of the run adopts it, delivering only what it has yet
+// to see.
+
+const FAKE_CLAUDE_ECHO = `
+import fs from "node:fs";
+const emit = (o) => process.stdout.write(JSON.stringify(o) + "\\n");
+const appendLog = (o) => { if (process.env.FAKE_CLAUDE_LOG) fs.appendFileSync(process.env.FAKE_CLAUDE_LOG, JSON.stringify(o) + "\\n"); };
+appendLog({ boot: true, argv: process.argv.slice(2) });
+emit({ type: "system", subtype: "init", model: "claude-sonnet-5" });
+let buf = "";
+process.stdin.on("end", () => process.exit(0));
+process.stdin.on("data", (c) => {
+  buf += c;
+  let i;
+  while ((i = buf.indexOf("\\n")) !== -1) {
+    const line = buf.slice(0, i);
+    buf = buf.slice(i + 1);
+    if (!line.trim()) continue;
+    const text = JSON.parse(line).message.content[0].text;
+    appendLog({ stdin: text });
+    const reply = "Echo: " + text;
+    emit({ type: "stream_event", event: { type: "content_block_delta", delta: { type: "text_delta", text: reply } } });
+    emit({ type: "assistant", message: { role: "assistant", content: [{ type: "text", text: reply }] } });
+    emit({ type: "result", subtype: "success", is_error: false, result: reply,
+      usage: { input_tokens: 10, output_tokens: 5 }, total_cost_usd: 0.01 });
+  }
+});
+`;
+
+const RUN_CONFIG = { ...CONFIG, subagentRunDir: "/run/dir" };
+
+function runDirConfig(runDir: string) {
+	return { ...CONFIG, subagentRunDir: runDir };
+}
+
+const sessionIdOf = (argv: string[], flag: string) => argv[argv.indexOf(flag) + 1];
+
+test("inside a run dir the child is resident: later turns adopt it and carry only the new message", async () => {
+	const scratch = fs.mkdtempSync(path.join(os.tmpdir(), "provider-resident-test-"));
+	const runDir = fs.mkdtempSync(path.join(os.tmpdir(), "provider-resident-run-"));
+	const claude = stubClaude(scratch, FAKE_CLAUDE_ECHO);
+	const config = runDirConfig(runDir);
+	try {
+		// Turn one: a full run, answered with no ask. The child stays.
+		const r1 = await collect(streamClaudeTurn(MODEL, userContext("map auth"), undefined, config));
+		assert.equal(r1.at(-1).reason, "stop");
+		const resident = residentSessions.get(runDir);
+		assert.ok(resident, "the child is resident after a plain completed turn");
+		assert.equal(resident!.proc.exitCode, null, "still alive, holding its context");
+
+		// Turn two: pi's transcript grew by one user message. The same process
+		// serves it, and only that message reaches its stdin.
+		const r2 = await collect(streamClaudeTurn(MODEL, contextWith([
+			{ role: "user", content: "map auth", timestamp: 1 } as Message,
+			{ role: "assistant", api: "test", provider: "test", model: "m", usage: zeroUsage(), stopReason: "stop", timestamp: 2,
+				content: [{ type: "text", text: "Mapped." }] },
+			{ role: "user", content: "now the login flow", timestamp: 3 } as Message,
+		]), undefined, config));
+		assert.equal(r2.at(-1).reason, "stop");
+		assert.ok(textOf(r2.at(-1).message).includes("Echo: now the login flow"));
+
+		assert.equal(claude.calls().filter((c: any) => c.boot).length, 1, "one claude process served the whole run");
+		const stdinLines = claude.calls().filter((c: any) => c.stdin !== undefined).map((c: any) => c.stdin);
+		assert.match(stdinLines[0], /\[user\]: map auth/, "the first spawn carries the transcript");
+		assert.equal(stdinLines[1], "now the login flow", "later turns carry only the new message");
+
+		// The first spawn named its session; the id is on file for a restart.
+		const boot1 = claude.calls()[0];
+		const recorded = fs.readFileSync(path.join(runDir, "claude-session-id"), "utf8").trim();
+		assert.equal(sessionIdOf(boot1.argv, "--session-id"), recorded, "the recorded id is the one the child was given");
+	} finally {
+		for (const session of [...residentSessions.values()]) { try { session.proc.kill("SIGTERM"); } catch { /* already gone */ } }
+		residentSessions.clear();
+		claude.restore();
+		fs.rmSync(scratch, { recursive: true, force: true });
+		fs.rmSync(runDir, { recursive: true, force: true });
+	}
+});
+
+test("a run picked back up after a restart joins the recorded session with only the new message", async () => {
+	const scratch = fs.mkdtempSync(path.join(os.tmpdir(), "provider-resume-test-"));
+	const runDir = fs.mkdtempSync(path.join(os.tmpdir(), "provider-resume-run-"));
+	fs.writeFileSync(path.join(runDir, "claude-session-id"), "0f0e0d0c-0b0a-4948-8476-554433221100\n", { mode: 0o600 });
+	const claude = stubClaude(scratch, FAKE_CLAUDE_ECHO);
+	try {
+		const events = await collect(streamClaudeTurn(MODEL, userContext("carry on from here"), undefined, runDirConfig(runDir)));
+		assert.equal(events.at(-1).reason, "stop");
+		const call = claude.calls()[0];
+		assert.deepEqual(sessionIdOf(call.argv, "--resume"), "0f0e0d0c-0b0a-4948-8476-554433221100", "the recorded session is joined, not restarted");
+		assert.ok(!call.argv.includes("--session-id"));
+		const stdin = claude.calls().find((c: any) => c.stdin !== undefined);
+		assert.equal(stdin!.stdin, "carry on from here", "only the message the child has yet to see travels");
+	} finally {
+		for (const session of [...residentSessions.values()]) { try { session.proc.kill("SIGTERM"); } catch { /* already gone */ } }
+		residentSessions.clear();
+		claude.restore();
+		fs.rmSync(scratch, { recursive: true, force: true });
+		fs.rmSync(runDir, { recursive: true, force: true });
+	}
+});
+
+test("a resume the claude store cannot join falls back to a fresh conversation with the full transcript", async () => {
+	const scratch = fs.mkdtempSync(path.join(os.tmpdir(), "provider-resume-fail-test-"));
+	const runDir = fs.mkdtempSync(path.join(os.tmpdir(), "provider-resume-fail-run-"));
+	fs.writeFileSync(path.join(runDir, "claude-session-id"), "deadbeef-0000-4000-8000-000000000000\n", { mode: 0o600 });
+	const claude = stubClaude(scratch, `
+if (process.argv.slice(2).includes("--resume")) {
+  fs.appendFileSync(process.env.FAKE_CLAUDE_LOG, JSON.stringify({ boot: true, argv: process.argv.slice(2), resumeFail: true }) + "\\n");
+  process.exit(1);
+}
+${FAKE_CLAUDE_ECHO}`);
+	try {
+		const events = await collect(streamClaudeTurn(MODEL, userContext("carry on from here"), undefined, runDirConfig(runDir)));
+		const done = events.at(-1);
+		assert.equal(done.type, "done", "the model saw one clean turn, not a resume error");
+		assert.equal(done.reason, "stop");
+		assert.ok(textOf(done.message).includes("[user]: carry on from here"), "the echo proves the full transcript traveled");
+
+		const boots = claude.calls().filter((c: any) => c.boot);
+		console.log("DBG21", JSON.stringify(claude.calls(), null, 0));
+		assert.equal(boots.length, 2, "one failed join, one fresh conversation");
+		assert.ok(boots[0].resumeFail && boots[0].argv.includes("--resume"));
+		const secondId = sessionIdOf(boots[1].argv, "--session-id");
+		assert.ok(secondId && secondId !== "deadbeef-0000-4000-8000-000000000000", "the retry named a new session");
+		assert.equal(fs.readFileSync(path.join(runDir, "claude-session-id"), "utf8").trim(), secondId, "the record now points at the session that exists");
+		const stdin = claude.calls().find((c: any) => c.stdin !== undefined);
+		assert.match(stdin!.stdin, /\[user\]: carry on from here/, "the fresh conversation carries the full transcript");
+	} finally {
+		for (const session of [...residentSessions.values()]) { try { session.proc.kill("SIGTERM"); } catch { /* already gone */ } }
+		residentSessions.clear();
+		claude.restore();
+		fs.rmSync(scratch, { recursive: true, force: true });
+		fs.rmSync(runDir, { recursive: true, force: true });
+	}
+});
+
+test("outside a run dir the child is fresh per request and no session id is named", async () => {
+	const scratch = fs.mkdtempSync(path.join(os.tmpdir(), "provider-fresh-test-"));
+	const claude = stubClaude(scratch, FAKE_CLAUDE_ECHO);
+	try {
+		await collect(streamClaudeTurn(MODEL, userContext("first"), undefined, CONFIG));
+		await collect(streamClaudeTurn(MODEL, userContext("second"), undefined, CONFIG));
+		const boots = claude.calls().filter((c: any) => c.boot);
+		assert.equal(boots.length, 2, "two requests, two children");
+		assert.ok(boots.every((c: any) => !c.argv.includes("--session-id") && !c.argv.includes("--resume")));
+		assert.ok(!residentSessions.size, "nothing is parked outside a run");
+	} finally {
+		claude.restore();
+		fs.rmSync(scratch, { recursive: true, force: true });
 	}
 });
