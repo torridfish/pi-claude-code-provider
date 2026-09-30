@@ -11,7 +11,7 @@ Each request spawns a fresh `claude -p` child and hands it pi's transcript as on
 Deliberate stage-one edges:
 
 - **Claude's tool calls are activity lines, not pi tool calls.** Emitting a pi `toolCall` would make pi execute a tool that belongs to the claude harness. Claude's own tool use (`▸ Read src/auth.ts`, its results) is visible in the streamed text instead. A later stage can relay tool calls back through an MCP bridge if pi is to own tool execution. The one exception is the ask bridge below: `caller_ping` is the child pi's own tool, not one of claude's.
-- **A fresh child per request.** Claude Code's prompt cache absorbs most of the repeated transcript cost, but a turn re-pays the harness's own system prompt. Cost metadata reflects the underlying Anthropic prices.
+- **A fresh child per request — outside a subagent run.** A main-session transcript can be rewritten between requests (compaction, branch, undo), and a child that re-reads the transcript each turn is always exactly where the transcript says it is. Inside a subagent run the child is resident for the run's life instead: later requests adopt it and carry only the messages it has yet to see, so the harness system prompt is paid once per run, not once per request. A run picked back up after a restart joins the claude session the first leg recorded (`--resume`; the id lives in a `claude-session-id` file in the run dir) — and if claude's own store no longer has that session, the driver retries once as a fresh conversation with the full transcript before giving up. Cost metadata reflects the underlying Anthropic prices.
 - **Text only.** Images are acknowledged in the transcript, not sent.
 - **Thinking maps to `--effort`** (`off`/`minimal` floor at `low`).
 
@@ -39,7 +39,7 @@ Environment variables, read when the provider is registered:
 | Variable | Default | Meaning |
 |---|---|---|
 | `CLAUDE_CODE_PROVIDER_COMMAND` | `claude` | The binary to run (resolved on PATH). |
-| `CLAUDE_CODE_PROVIDER_TOOLS` | `Read,Grep,Glob,WebSearch,WebFetch` | The child's `--allowedTools` — what a headless turn may do without a human prompt. Read-only by default on purpose: widening it means claude's `Edit`/`Write`/`Bash` run unattended inside pi's turns. |
+| `CLAUDE_CODE_PROVIDER_TOOLS` | `Read,Grep,Glob,WebSearch,WebFetch` | The child's `--allowedTools` — what a headless turn may do without a human prompt. Read-only by default on purpose: widening it means claude's `Edit`/`Write`/`Bash` run unattended inside pi's turns. Note the effective surface also includes Claude Code's built-in set of read-only Bash commands (`ls`, `cat`, `grep`, `find`, read-only `git`, …), which run without a prompt in every mode and cannot be configured away — `--permission-prompts none` denies everything else that would prompt, it allows nothing. |
 | `CLAUDE_CODE_PROVIDER_MAX_BUDGET_USD` | unset | A hard ceiling per request, passed as `--max-budget-usd`. |
 | `CLAUDE_CODE_PROVIDER_ASK_SERVER` | sibling checkout | Where the ask MCP server lives (see below); the bridge is off when it cannot be found. |
 
@@ -56,7 +56,7 @@ The mechanics, per ask:
 3. The claude process that asked is **parked, not killed**: its stdin stays open and its in-process context — everything it did that pi's transcript never saw — survives. Stream events that arrive with no request to consume them are buffered.
 4. The next request adopts the parked child. Right after the tool result it carries no new message: the child finishes its ask turn on its own and the buffered events replay into that request. When the parent's answer arrives (a later user message), the driver writes just that text into the parked child's stdin — and appends the delivery marker to `answers.jsonl`, which the parent does for its own runner children but not for pi ones — and the child's completion streams as that turn's assistant message. Further asks repeat the cycle in the same process.
 
-The parked child dies with the run: an aborted request kills it, and the provider process exiting SIGTERMs whatever is still parked. A run picked back up after a restart has no parked child and falls back to the fresh-spawn-per-request behavior, continuing from the serialized transcript.
+The resident child dies with the run: an aborted request kills it, and the provider process exiting SIGTERMs whatever is still open. A run picked back up after a restart finds no resident child and joins the recorded claude session (`--resume`) instead — only a claude whose own store no longer has that session falls back to a fresh conversation with the full serialized transcript.
 
 The ask server path is the sibling checkout's `runners/claude-ask.mjs` (one implementation of the ask protocol for both consumers), overridable with `CLAUDE_CODE_PROVIDER_ASK_SERVER`; without it the bridge stays off.
 

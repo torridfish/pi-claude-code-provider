@@ -16,9 +16,16 @@
  *    as pi tool calls — emitting those would make pi execute tools that
  *    belong to the claude harness. A later stage can relay them back through
  *    an MCP bridge if pi is to own tool execution.
- *  - The child is spawned fresh per request. Claude Code's prompt cache
- *    absorbs most of the repeated context cost, but a turn still re-pays the
- *    harness's own system prompt.
+ *  - The child is spawned fresh per request outside a subagent run — pi can
+ *    rewrite its transcript between requests (compaction, branch, undo), and
+ *    a child that re-reads the transcript each turn is always where the
+ *    transcript says it is. Inside a subagent run the child is resident for
+ *    the run's life: later requests adopt it and carry only the messages it
+ *    has yet to see, and a run picked back up after a restart joins the
+ *    recorded claude session (`--resume`) instead of starting over. Claude
+ *    Code's prompt cache absorbs most of the repeated context cost either
+ *    way; the per-turn harness system prompt is paid once per run, not once
+ *    per request.
  *  - Images are described, not sent. The CLI's stream-json user message
  *    carries text only here.
  *  - One exception to "no pi tool calls": inside a pi-subagents child the ask
