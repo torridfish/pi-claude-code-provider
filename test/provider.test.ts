@@ -737,3 +737,196 @@ test("outside a run dir the child is fresh per request and no session id is name
 		fs.rmSync(scratch, { recursive: true, force: true });
 	}
 });
+
+// ── The tool relay: pi's tools, executed by pi ────────────────────────
+
+const RELAY_TOOLS = [
+	{ name: "lookup", description: "Look a path up.", inputSchema: { type: "object", properties: { path: { type: "string" } }, required: ["path"] } },
+	{ name: "count", description: "Count a pattern.", inputSchema: { type: "object", properties: { pattern: { type: "string" } }, required: ["pattern"] } },
+];
+
+const RELAY_CONFIG_BASE: ClaudeDriverConfig = { ...CONFIG, subagentRunDir: "/run/dir", relayServerPath: "/srv/relay.mjs" };
+
+test("the relay travels as a second MCP server with every tool pre-approved", () => {
+	const args = buildClaudeCodeArgs("claude-sonnet-5", undefined, "", RELAY_CONFIG_BASE, { relayTools: RELAY_TOOLS });
+	const mcpIdx = args.indexOf("--mcp-config");
+	const servers = JSON.parse(args[mcpIdx + 1]).mcpServers;
+	assert.equal(servers.pi_relay.command, process.execPath);
+	assert.deepEqual(servers.pi_relay.args, ["/srv/relay.mjs"]);
+	assert.deepEqual(servers.pi_relay.env, { PI_SUBAGENT_RUN_DIR: "/run/dir" });
+	assert.ok(args.includes("mcp__pi_relay__lookup"), "each relayed tool is pre-approved by its mangled MCP name");
+
+	// No relay tools named, no relay server: a catalog is dynamic, a missing
+	// one is just an MCP server that lists nothing.
+	const bare = buildClaudeCodeArgs("claude-sonnet-5", undefined, "", RELAY_CONFIG_BASE);
+	assert.ok(!bare.includes("--mcp-config"), "no catalog and no ask server, no sidecars at all");
+	assert.ok(!bare.some((a) => a.includes("mcp__pi_relay__")));
+
+	// Outside a run dir the relay never arms, catalog or not.
+	const outside = buildClaudeCodeArgs("claude-sonnet-5", undefined, "", CONFIG, { relayTools: RELAY_TOOLS });
+	assert.ok(!outside.includes("--mcp-config"));
+});
+
+// A stand-in that speaks MCP to the REAL relay server, calls one or two of
+// its tools, and holds the calls open exactly as claude would until the
+// driver's result files land.
+const FAKE_CLAUDE_RELAY = `
+import fs from "node:fs";
+import { spawn } from "node:child_process";
+const argv = process.argv.slice(2);
+const emit = (o) => process.stdout.write(JSON.stringify(o) + "\\n");
+const appendLog = (o) => { if (process.env.FAKE_CLAUDE_LOG) fs.appendFileSync(process.env.FAKE_CLAUDE_LOG, JSON.stringify(o) + "\\n"); };
+appendLog({ boot: true, argv });
+const parallel = process.env.FAKE_RELAY_MODE === "parallel";
+
+const mcpIdx = argv.indexOf("--mcp-config");
+const servers = JSON.parse(argv[mcpIdx + 1]).mcpServers;
+const relay = servers.pi_relay;
+if (!relay) { emit({ type: "result", subtype: "error_during_execution", is_error: true, result: "no pi_relay server" }); process.exit(1); }
+const child = spawn(relay.command, relay.args, { env: Object.assign({}, process.env, relay.env), stdio: ["pipe", "pipe", "pipe"] });
+let mcpBuf = "";
+const pending = new Map();
+child.stdout.on("data", (d) => {
+  mcpBuf += d;
+  let i;
+  while ((i = mcpBuf.indexOf("\\n")) !== -1) {
+    const line = mcpBuf.slice(0, i); mcpBuf = mcpBuf.slice(i + 1);
+    if (!line.trim()) continue;
+    let msg; try { msg = JSON.parse(line); } catch { continue; }
+    const waiter = pending.get(msg.id);
+    if (waiter) { pending.delete(msg.id); waiter(msg); }
+  }
+});
+let rpcId = 0;
+const rpc = (method, params) => new Promise((resolve) => {
+  const id = String(++rpcId);
+  pending.set(id, resolve);
+  child.stdin.write(JSON.stringify({ jsonrpc: "2.0", id, method, params }) + "\\n");
+});
+
+await rpc("initialize", { protocolVersion: "2025-06-18", capabilities: {}, clientInfo: { name: "fake-claude", version: "1" } });
+child.stdin.write(JSON.stringify({ jsonrpc: "2.0", method: "notifications/initialized" }) + "\\n");
+const listed = await rpc("tools/list", {});
+appendLog({ mcp: { tools: listed.result.tools.map((t) => t.name) } });
+emit({ type: "system", subtype: "init", model: "claude-sonnet-5" });
+
+let buf = "";
+const queue = []; let waiter;
+process.stdin.on("end", () => process.exit(0));
+process.stdin.on("data", (c) => {
+  buf += c;
+  let i;
+  while ((i = buf.indexOf("\\n")) !== -1) {
+    const line = buf.slice(0, i); buf = buf.slice(i + 1);
+    if (!line.trim()) continue;
+    const text = JSON.parse(line).message.content[0].text;
+    appendLog({ stdin: text });
+    if (waiter) { const w = waiter; waiter = undefined; w(text); } else queue.push(text);
+  }
+});
+const nextMessage = () => new Promise((r) => { if (queue.length) r(queue.shift()); else waiter = r; });
+
+// Turn one: preamble text, then the relayed call(s) — the assistant message
+// hits the stream BEFORE the harness blocks in tools/call, as in real claude.
+await nextMessage();
+const calls = parallel
+  ? [{ id: "r1", name: "mcp__pi_relay__lookup", input: { path: "a.ts" } }, { id: "r2", name: "mcp__pi_relay__count", input: { pattern: "TODO" } }]
+  : [{ id: "r1", name: "mcp__pi_relay__lookup", input: { path: "src/auth.ts" } }];
+emit({ type: "stream_event", event: { type: "content_block_delta", delta: { type: "text_delta", text: "Asking pi. " } } });
+emit({ type: "assistant", message: { role: "assistant", content: calls.map((c) => ({ type: "tool_use", id: c.id, name: c.name, input: c.input })) } });
+const results = await Promise.all(calls.map((c) => rpc("tools/call", { name: c.name.slice("mcp__pi_relay__".length), arguments: c.input }).then((r) => ({ c, r }))));
+emit({ type: "user", message: { role: "user", content: results.map(({ c, r }) => ({
+  type: "tool_result", tool_use_id: c.id,
+  content: [{ type: "text", text: r.result.content.map((x) => x.text).join(" ") }], is_error: !!r.result.isError,
+})) } });
+const closing = "Relay done: " + results.map(({ r }) => r.result.content[0].text).join(" | ");
+emit({ type: "stream_event", event: { type: "content_block_delta", delta: { type: "text_delta", text: closing } } });
+emit({ type: "assistant", message: { role: "assistant", content: [{ type: "text", text: closing }] } });
+emit({ type: "result", subtype: "success", is_error: false, result: closing,
+  usage: { input_tokens: 50, output_tokens: 10 }, total_cost_usd: 0.01 });
+
+for (;;) {
+  const message = await nextMessage();
+  const reply = "Answered: " + message;
+  emit({ type: "assistant", message: { role: "assistant", content: [{ type: "text", text: reply }] } });
+  emit({ type: "result", subtype: "success", is_error: false, result: reply, usage: { input_tokens: 60, output_tokens: 10 }, total_cost_usd: 0.02 });
+}
+`;
+
+const RELAY_SERVER_PATH = fileURLToPath(new URL("../src/relay-server.mjs", import.meta.url));
+
+function relayRunConfig(runDir: string): ClaudeDriverConfig {
+	return {
+		...CONFIG,
+		subagentRunDir: runDir,
+		relayServerPath: RELAY_SERVER_PATH,
+		getRelayTools: () => RELAY_TOOLS,
+	};
+}
+
+async function testRelay(mode: "single" | "parallel") {
+	const scratch = fs.mkdtempSync(path.join(os.tmpdir(), `provider-relay-${mode}-`));
+	const runDir = fs.mkdtempSync(path.join(os.tmpdir(), `provider-relay-run-${mode}-`));
+	const oldMode = process.env.FAKE_RELAY_MODE;
+	process.env.FAKE_RELAY_MODE = mode;
+	const claude = stubClaude(scratch, FAKE_CLAUDE_RELAY);
+	const config = relayRunConfig(runDir);
+	try {
+		// Request 1: claude calls a pi tool; the driver surfaces it as a real
+		// tool call and the turn ends the way any tool call ends a turn.
+		const r1 = await collect(streamClaudeTurn(MODEL, userContext("find auth"), undefined, config));
+		const done1 = r1.at(-1);
+		assert.equal(done1.type, "done");
+		assert.equal(done1.reason, "toolUse");
+		const calls = done1.message.content.filter((c: any) => c.type === "toolCall");
+		const expected = mode === "parallel" ? 2 : 1;
+		assert.equal(calls.length, expected, "the relayed calls are real pi tool calls");
+		assert.deepEqual(calls[0], { type: "toolCall", id: "r1", name: "lookup", arguments: { path: mode === "parallel" ? "a.ts" : "src/auth.ts" } });
+		if (mode === "parallel") assert.deepEqual(calls[1], { type: "toolCall", id: "r2", name: "count", arguments: { pattern: "TODO" } });
+		assert.ok(!textOf(done1.message).includes("▸ mcp__pi_relay__"), "no activity line for a call pi will execute itself");
+
+		// The catalog the server served came from the file the driver wrote.
+		assert.deepEqual(JSON.parse(fs.readFileSync(path.join(runDir, "relay-tools.json"), "utf8")), RELAY_TOOLS);
+		const boot = claude.calls().find((c: any) => c.mcp);
+		assert.deepEqual(boot.mcp.tools, RELAY_TOOLS.map((t) => t.name), "the server listed the driver's catalog");
+
+		// Request 2: pi executed the calls; the results feed the waiting relay
+		// server and claude's continuing turn replays into this request.
+		const results: Record<string, string> = mode === "parallel"
+			? { r1: "contents of a", r2: "3 matches" }
+			: { r1: "the auth contents" };
+		const r2 = await collect(streamClaudeTurn(MODEL, contextWith([
+			{ role: "user", content: "find auth", timestamp: 1 } as Message,
+			{ role: "assistant", api: "test", provider: "test", model: "m", usage: zeroUsage(), stopReason: "toolUse", timestamp: 2,
+				content: calls },
+			...calls.map((c: any, i: number) => ({ role: "toolResult", toolCallId: c.id, toolName: c.name, isError: false,
+				content: [{ type: "text", text: results[c.id] }], timestamp: 3 + i } as Message)),
+		]), undefined, config));
+		const done2 = r2.at(-1);
+		assert.equal(done2.type, "done");
+		assert.equal(done2.reason, "stop");
+		assert.ok(textOf(done2.message).includes(Object.values(results).join(" | ")), `got: ${JSON.stringify(textOf(done2.message))}`);
+		assert.equal(claude.calls().filter((c: any) => c.boot).length, 1, "one claude process served the whole exchange");
+
+		// The claimed results are consumed, not left behind.
+		const leftover = fs.existsSync(path.join(runDir, "relay-res"))
+			? fs.readdirSync(path.join(runDir, "relay-res")).filter((f) => f.endsWith(".res"))
+			: [];
+		assert.deepEqual(leftover, []);
+	} finally {
+		for (const session of [...residentSessions.values()]) { try { session.proc.kill("SIGTERM"); } catch { /* already gone */ } }
+		residentSessions.clear();
+		if (oldMode === undefined) delete process.env.FAKE_RELAY_MODE; else process.env.FAKE_RELAY_MODE = oldMode;
+		claude.restore();
+		fs.rmSync(scratch, { recursive: true, force: true });
+		fs.rmSync(runDir, { recursive: true, force: true });
+	}
+}
+
+test("a relayed call is a real pi tool call, executed by pi, answered over the relay", async () => {
+	await testRelay("single");
+});
+
+test("parallel relayed calls surface together and each result reaches its call", async () => {
+	await testRelay("parallel");
+});
