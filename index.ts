@@ -42,7 +42,7 @@ import * as fs from "node:fs";
 import { fileURLToPath } from "node:url";
 import type { ExtensionAPI, ProviderModelConfig } from "@earendil-works/pi-coding-agent";
 import type { Api, Model, SimpleStreamOptions, TranscriptContext } from "@earendil-works/pi-ai/compat";
-import { getCurrentSystemPrompt } from "@earendil-works/pi-ai/utils/transcript";
+import { getCurrentSystemPrompt } from "./src/vendor/transcript.ts";
 import { buildCatalog, resolveClaudeBinary } from "./src/catalog.ts";
 import { ASK_PI_TOOL, resolveAskServerPath } from "./src/ask.ts";
 import type { RelayToolSpec } from "./src/relay.ts";

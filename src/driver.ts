@@ -70,12 +70,13 @@ import type {
 	TranscriptContext,
 } from "@earendil-works/pi-ai/compat";
 import type { AssistantMessageEventStream } from "@earendil-works/pi-ai/utils/event-stream";
-import { createAssistantMessageEventStream } from "@earendil-works/pi-ai/utils/event-stream";
-// From the util subpaths rather than the compat barrel: an extension loaded by
-// the host's module loader can have the barrel's circular internals snapshotted
-// mid-evaluation, dropping re-exported names (observed: getCurrentSystemPrompt
-// undefined in a child process). The leaf subpaths have no cycle to fall into.
-import { getCurrentSystemPrompt } from "@earendil-works/pi-ai/utils/transcript";
+// The stream factory and getCurrentSystemPrompt are vendored (see
+// src/vendor/event-stream.ts): pi's extension loader maps only a fixed set of
+// pi-ai subpaths, so a git-installed clone without its own node_modules cannot
+// resolve @earendil-works/pi-ai/utils/* value imports ("Cannot find module").
+// Type-only imports stay on the real subpaths — they are erased at runtime.
+import { createAssistantMessageEventStream } from "./vendor/event-stream.ts";
+import { getCurrentSystemPrompt } from "./vendor/transcript.ts";
 import { ASK_PI_TOOL, ASK_SERVER, ASK_TOOL } from "./ask.ts";
 import { RELAY_PREFIX, RELAY_SERVER, deliverRelayResult, relayToolMcpName, writeRelayCatalog, type RelayToolSpec } from "./relay.ts";
 import { flattenText, serializeTranscript } from "./serialize.ts";
