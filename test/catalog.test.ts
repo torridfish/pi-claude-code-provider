@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import { buildCatalog, FALLBACK_ALIASES, parseCatalogFromText, resolveClaudeBinary, scanBinary } from "../src/catalog.ts";
+import { buildCatalog, clearCatalogCache, FALLBACK_ALIASES, getCachedCatalog, parseCatalogFromText, resolveClaudeBinary, scanBinary } from "../src/catalog.ts";
 
 // A faithful slice of what the binary carries: the id table and the alias
 // array, in the shapes the parser anchors on.
@@ -89,5 +89,57 @@ test("the command resolves through shims to the binary that carries the catalog"
 		assert.throws(() => resolveClaudeBinary("definitely-not-on-path-test"), /Cannot resolve/);
 	} finally {
 		fs.rmSync(directory, { recursive: true, force: true });
+	}
+});
+
+// ── The scan cache ─────────────────────────────────────────────────
+//
+// The registration preload and concurrent refreshes must share one scan per
+// binary version, so the first caller's scanned array is the same object the
+// second caller resolves — identity is the proof that the promise was shared.
+
+test("concurrent scans of one binary share the single cached scan", async () => {
+	const directory = fs.mkdtempSync(path.join(os.tmpdir(), "catalog-cache-test-"));
+	try {
+		clearCatalogCache();
+		const binary = path.join(directory, "claude");
+		fs.writeFileSync(binary, BINARY_TEXT);
+		const [first, second] = await Promise.all([getCachedCatalog(binary), getCachedCatalog(binary)]);
+		assert.strictEqual(first, second, "both callers awaited the one scan's promise");
+		assert.equal(first.length, 11, "9 aliases + 2 scanned ids — the full catalog, not a fallback");
+	} finally {
+		clearCatalogCache();
+		fs.rmSync(directory, { recursive: true, force: true });
+	}
+});
+
+test("a changed binary is rescanned, not served from the cache", async () => {
+	const directory = fs.mkdtempSync(path.join(os.tmpdir(), "catalog-cache-test-"));
+	try {
+		clearCatalogCache();
+		const binary = path.join(directory, "claude");
+		fs.writeFileSync(binary, BINARY_TEXT);
+		const first = await getCachedCatalog(binary);
+		// A different size is a different key even within one mtime tick.
+		fs.writeFileSync(binary, BINARY_TEXT + 'var e9={first_party:"claude-opus-4-1-20250805",bedrock:null};\n');
+		const second = await getCachedCatalog(binary);
+		assert.notStrictEqual(second, first, "the changed binary got a fresh scan");
+		assert.equal(second.some((e) => e.id === "claude-opus-4-1-20250805"), true, "the new catalog reflects the new binary");
+	} finally {
+		clearCatalogCache();
+		fs.rmSync(directory, { recursive: true, force: true });
+	}
+});
+
+test("an unstatable path is never cached and still falls back", async () => {
+	clearCatalogCache();
+	try {
+		const first = await getCachedCatalog("/nonexistent/claude-cache-test");
+		assert.deepEqual(first.map((e) => e.id), FALLBACK_ALIASES);
+		const second = await getCachedCatalog("/nonexistent/claude-cache-test");
+		assert.notStrictEqual(second, first, "no key, no cache: every attempt is a fresh fallback");
+		assert.deepEqual(second.map((e) => e.id), FALLBACK_ALIASES);
+	} finally {
+		clearCatalogCache();
 	}
 });

@@ -121,6 +121,35 @@ export async function scanBinary(binaryPath: string, chunkBytes = 8 << 20, overl
 	});
 }
 
+// One scan per binary version, shared process-wide. The key is the binary's
+// path + size + mtime: the initial registration, a preload and any concurrent
+// refreshes of the same binary coalesce onto a single scan, and a changed
+// binary gets a new key and is rescanned. An unstatable path has no key —
+// the attempt runs uncached and falls back inside buildCatalog, as before.
+let cachedKey: string | undefined;
+let cachedPromise: Promise<CatalogEntry[]> | undefined;
+
+/** Drops the scan cache, so the next call rescans (tests). */
+export function clearCatalogCache(): void {
+	cachedKey = undefined;
+	cachedPromise = undefined;
+}
+
+/** buildCatalog, one scan per binary version. The stored promise never
+ *  rejects: buildCatalog's own fallback turns an unreadable binary into the
+ *  static alias catalog, so the cache cannot pin a failure. */
+export async function getCachedCatalog(binaryPath: string): Promise<CatalogEntry[]> {
+	let key: string | undefined;
+	try {
+		const stat = fs.statSync(binaryPath);
+		key = `${binaryPath}:${stat.size}:${stat.mtimeMs}`;
+	} catch { /* unstatable: run uncached, let buildCatalog fall back */ }
+	if (key !== undefined && key === cachedKey && cachedPromise) return cachedPromise;
+	const promise = buildCatalog(binaryPath);
+	if (key !== undefined) { cachedKey = key; cachedPromise = promise; }
+	return promise;
+}
+
 export function resolveClaudeBinary(command: string): string {
 	const resolved = command.includes("/") ? command : (() => {
 		for (const dir of (process.env.PATH || "").split(":")) {
