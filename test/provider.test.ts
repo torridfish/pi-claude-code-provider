@@ -8,6 +8,8 @@ import { normalizeContext, type Message, type TranscriptContext } from "@earendi
 import { serializeTranscript, TRANSCRIPT_HEADER } from "../src/serialize.ts";
 import { ASK_PI_TOOL, ASK_TOOL } from "../src/ask.ts";
 import { buildClaudeCodeArgs, DEFAULT_TOOLS, residentSessions, resolveEffort, streamClaudeTurn, type ClaudeDriverConfig } from "../src/driver.ts";
+import { clearCatalogCache } from "../src/catalog.ts";
+import extension, { refreshModels } from "../index.ts";
 
 function zeroUsage() {
 	return { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } };
@@ -929,4 +931,90 @@ test("a relayed call is a real pi tool call, executed by pi, answered over the r
 
 test("parallel relayed calls surface together and each result reaches its call", async () => {
 	await testRelay("parallel");
+});
+
+// ── Registration and the catalog race ───────────────────────────────
+//
+// pi waits for an async extension factory before startup, so the very first
+// registration must already carry the full scanned catalog. Against a fake
+// binary — no real claude on this machine — the scanned list (aliases first,
+// then ids) is distinguishable from the static four-model fallback precisely
+// by the ids only the scan can produce.
+
+const CATALOG_FAKE = `
+var e1={first_party:"claude-opus-5",bedrock:"us.anthropic.claude-opus-5",vertex:"claude-opus-5"};
+var e2={first_party:"claude-sonnet-4-5-20250929",bedrock:"us.anthropic.claude-sonnet-4-5-20250929-v1:0",vertex:"claude-sonnet-4-5@20250929"};
+var e3={first_party:"claude-haiku-4-5-20251001",bedrock:null};
+var aj=["sonnet","opus","haiku","fable","best","sonnet[1m]","opus[1m]","fable[1m]","opusplan"],B6=["sonnet","opus","haiku","fable"];
+`;
+
+/** Points CLAUDE_CODE_PROVIDER_COMMAND at a fake binary carrying `text`. */
+function stubCatalogBinary(text: string) {
+	const directory = fs.mkdtempSync(path.join(os.tmpdir(), "provider-catalog-test-"));
+	fs.writeFileSync(path.join(directory, "claude"), text);
+	const oldCommand = process.env.CLAUDE_CODE_PROVIDER_COMMAND;
+	process.env.CLAUDE_CODE_PROVIDER_COMMAND = path.join(directory, "claude");
+	return {
+		restore: () => {
+			if (oldCommand === undefined) delete process.env.CLAUDE_CODE_PROVIDER_COMMAND; else process.env.CLAUDE_CODE_PROVIDER_COMMAND = oldCommand;
+			fs.rmSync(directory, { recursive: true, force: true });
+		},
+	};
+}
+
+/** The sliver of ExtensionAPI the factory touches at registration time. */
+function fakePi() {
+	let registered: any;
+	const pi = { registerProvider: (_name: string, config: any) => { registered = config; } } as any;
+	return { pi, registered: () => registered };
+}
+
+test("the async factory's first registration is already the full scanned catalog", async () => {
+	clearCatalogCache();
+	const stub = stubCatalogBinary(CATALOG_FAKE);
+	try {
+		const { pi, registered } = fakePi();
+		await extension(pi);
+		const models = registered().models;
+		assert.equal(registered().name, "Claude Code");
+		assert.equal(models.length, 12, "9 aliases + 3 scanned ids, not the static four");
+		assert.equal(models[0].id, "sonnet", "aliases lead, in the binary's own order");
+		assert.equal(models.some((m: any) => m.id === "claude-opus-5"), true, "the precise scanned id is registered up front");
+		assert.equal(models.every((m: any) => m.api === "claude-code-harness"), true);
+	} finally {
+		stub.restore();
+		clearCatalogCache();
+	}
+});
+
+test("concurrent refreshes share one scan and never fall back to the static four", async () => {
+	clearCatalogCache();
+	const stub = stubCatalogBinary(CATALOG_FAKE);
+	try {
+		const [a, b] = await Promise.all([refreshModels(), refreshModels()]);
+		assert.equal(a.length, 12, "the full catalog, not the static four");
+		assert.equal(a.some((m: any) => m.id === "claude-opus-5"), true);
+		assert.deepEqual(a, b, "both refreshes resolved from the one shared scan");
+	} finally {
+		stub.restore();
+		clearCatalogCache();
+	}
+});
+
+test("an unreadable binary degrades registration and refresh to the static catalog", async () => {
+	clearCatalogCache();
+	const oldCommand = process.env.CLAUDE_CODE_PROVIDER_COMMAND;
+	process.env.CLAUDE_CODE_PROVIDER_COMMAND = "/nonexistent/claude-provider-test";
+	try {
+		const { pi, registered } = fakePi();
+		await extension(pi);
+		const staticIds = ["fable", "opus", "sonnet", "haiku"];
+		assert.deepEqual(registered().models.map((m: any) => m.id), staticIds, "registration fell back to the static four");
+		const refreshed = await refreshModels();
+		assert.deepEqual(refreshed.map((m: any) => m.id), staticIds, "so does the refresh");
+		assert.equal(refreshed[0].cost.input, 10, "the static costs survive the fallback");
+	} finally {
+		if (oldCommand === undefined) delete process.env.CLAUDE_CODE_PROVIDER_COMMAND; else process.env.CLAUDE_CODE_PROVIDER_COMMAND = oldCommand;
+		clearCatalogCache();
+	}
 });

@@ -43,7 +43,7 @@ import { fileURLToPath } from "node:url";
 import type { ExtensionAPI, ProviderModelConfig } from "@earendil-works/pi-coding-agent";
 import type { Api, Model, SimpleStreamOptions, TranscriptContext } from "@earendil-works/pi-ai/compat";
 import { getCurrentSystemPrompt } from "./src/vendor/transcript.ts";
-import { buildCatalog, resolveClaudeBinary } from "./src/catalog.ts";
+import { getCachedCatalog, resolveClaudeBinary } from "./src/catalog.ts";
 import { ASK_PI_TOOL, resolveAskServerPath } from "./src/ask.ts";
 import type { RelayToolSpec } from "./src/relay.ts";
 import { DEFAULT_TOOLS, streamClaudeTurn, type ClaudeDriverConfig } from "./src/driver.ts";
@@ -137,21 +137,9 @@ export function streamClaudeCode(
 	return streamClaudeTurn(model, context, options, resolveConfig());
 }
 
-/**
- * The refresh: every model this CLI version accepts, read out of the binary
- * the user runs. Degrades to the static alias catalog when the binary cannot
- * be read or no longer matches the shapes we know — a degraded refresh beats
- * an empty catalog.
- */
-export async function refreshModels(): Promise<ProviderModelConfig[]> {
-	const config = resolveConfig();
-	let entries;
-	try {
-		entries = await buildCatalog(resolveClaudeBinary(config.command));
-	} catch {
-		entries = MODELS.map((m) => ({ ...m, alias: true }));
-	}
-	return entries.map(({ id, name, contextWindow, maxTokens, input, output }) => ({
+/** Any catalog entry — static or scanned — as pi's model definition. */
+function toProviderModel({ id, name, contextWindow, maxTokens, input, output }: ProviderModel): ProviderModelConfig {
+	return {
 		id,
 		name,
 		api: "claude-code-harness",
@@ -161,11 +149,35 @@ export async function refreshModels(): Promise<ProviderModelConfig[]> {
 		cost: { input, output, cacheRead: input / 10, cacheWrite: input * 1.25 },
 		contextWindow,
 		maxTokens,
-	}));
+	};
 }
 
-export default function (pi: ExtensionAPI) {
+/**
+ * The refresh: every model this CLI version accepts, read out of the binary
+ * the user runs, through the binary-versioned scan cache — a preload and any
+ * concurrent refreshes of one binary share a single scan, and a changed
+ * binary is rescanned. Degrades to the static alias catalog when the binary
+ * cannot be read or no longer matches the shapes we know — a degraded refresh
+ * beats an empty catalog.
+ */
+export async function refreshModels(): Promise<ProviderModelConfig[]> {
+	let entries: ProviderModel[];
+	try {
+		entries = await getCachedCatalog(resolveClaudeBinary(resolveConfig().command));
+	} catch {
+		entries = MODELS.map((m) => ({ ...m, alias: true }));
+	}
+	return entries.map(toProviderModel);
+}
+
+export default async function (pi: ExtensionAPI) {
 	piHandle = pi;
+	// Awaited before registration on purpose: pi waits for an async factory
+	// before startup, so the very first registration already carries the full
+	// scanned catalog. A synchronous registration of the static four would be
+	// recomposed away by the first refresh — a window `--list-models` could
+	// catch, showing 4 or the full list depending on which refresh won.
+	const models = await refreshModels();
 	pi.registerProvider("claude-code", {
 		name: "Claude Code",
 		// No endpoint and no key of ours: the claude binary owns its own auth
@@ -174,17 +186,7 @@ export default function (pi: ExtensionAPI) {
 		baseUrl: "claude-code://local",
 		apiKey: "claude-code-harness",
 		api: "claude-code-harness",
-		models: MODELS.map(({ id, name, contextWindow, maxTokens, input, output }) => ({
-			id,
-			name,
-			api: "claude-code-harness",
-			reasoning: true,
-			thinkingLevelMap: { minimal: "low", xhigh: "max" },
-			input: ["text"],
-			cost: { input, output, cacheRead: input / 10, cacheWrite: input * 1.25 },
-			contextWindow,
-			maxTokens,
-		})),
+		models,
 		streamSimple: streamClaudeCode,
 		refreshModels: () => refreshModels(),
 	});
