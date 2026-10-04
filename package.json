@@ -1,6 +1,6 @@
 {
   "name": "pi-claude-code-provider",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "private": true,
   "description": "pi provider backed by the Claude Code CLI (claude -p)",
   "type": "module",
